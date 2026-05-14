@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import threading
 import time
 
 import pytest
@@ -10,6 +11,10 @@ import pytest
 def disable_mysql_cache(monkeypatch):
     app_module = importlib.import_module("app")
     monkeypatch.setattr(app_module, "MYSQL_SEARCH_CACHE", None)
+    monkeypatch.setattr(app_module, "MYSQL_HOTEL_NAME_CACHE", None)
+    with app_module.HOTEL_NAME_CACHE_LOCK:
+        app_module.HOTEL_NAME_MEMORY_CACHE = {"byHotelId": {}, "byNameKey": {}}
+        app_module.HOTEL_NAME_CACHE_LOADED = False
 
 
 def sample_result(sort_by: str = "discount") -> dict:
@@ -232,8 +237,12 @@ def test_tripcom_search_returns_immediate_progress_job(monkeypatch, tmp_path):
     app_module = importlib.import_module("app")
     monkeypatch.setattr(app_module, "SEARCH_CACHE_DIR", tmp_path / "search_cache")
     monkeypatch.setattr(app_module, "HOT_SEARCH_PATH", tmp_path / "hot_searches.json")
+    monkeypatch.setattr(app_module, "HOTEL_NAME_CACHE_PATH", tmp_path / "hotel_name_cache.json")
     app_module.SEARCH_CACHE.clear()
     app_module.SEARCH_JOBS.clear()
+    with app_module.HOTEL_NAME_CACHE_LOCK:
+        app_module.HOTEL_NAME_MEMORY_CACHE = {"byHotelId": {}, "byNameKey": {}}
+        app_module.HOTEL_NAME_CACHE_LOADED = False
 
     calls = []
 
@@ -378,7 +387,7 @@ def test_search_status_keeps_provisional_raw_candidates_before_cn_name_ready(mon
     assert response.status_code == 200
     assert result["summary"]["candidateCount"] == 1
     assert result["allHotels"][0]["hotelId"] == "raw-en"
-    assert result["allHotels"][0]["hotelName"] == "星级酒店（中文名待核验）"
+    assert result["allHotels"][0]["hotelName"] == "星级酒店（中文名正在核验中...）"
     assert result["allHotels"][0]["hotelOriginalName"] == "Unknown Star Hotel"
 
 
@@ -420,10 +429,235 @@ def test_apply_sort_retains_unlocalized_deal_hotels_without_deferred_flag():
 
     assert sorted_result["summary"]["candidateCount"] == 1
     assert sorted_result["summary"]["dealCount"] == 1
-    assert sorted_result["allHotels"][0]["hotelName"] == "深圳星级酒店（中文名待核验）"
+    assert sorted_result["allHotels"][0]["hotelName"] == "深圳星级酒店（中文名正在核验中...）"
     assert sorted_result["allHotels"][0]["hotelOriginalName"] == "Raw Deal Hotel"
-    assert sorted_result["dealHotels"][0]["hotelName"] == "深圳星级酒店（中文名待核验）"
+    assert sorted_result["dealHotels"][0]["hotelName"] == "深圳星级酒店（中文名正在核验中...）"
     assert sorted_result["dealHotels"][0]["hotelOriginalName"] == "Raw Deal Hotel"
+
+
+def test_name_verification_finalizes_pending_names_without_remote_match():
+    app_module = importlib.import_module("app")
+    result = {
+        "query": {"city": "深圳", "sortBy": "discount"},
+        "targetHotel": {},
+        "compareDates": ["2026-06-01"],
+        "allHotels": [
+            {
+                "hotelId": "12345",
+                "hotelName": "深圳星级酒店（中文名正在核验中...）",
+                "hotelOriginalName": "Raw Star Hotel Shenzhen",
+                "starRating": 4,
+                "distanceKm": 1.2,
+                "currentPrice": 480,
+                "isDeal": False,
+                "isRecommendedBrand": False,
+                "nameProcessing": True,
+            }
+        ],
+        "dealHotels": [],
+        "recommendedHotels": [],
+        "summary": {"candidateCount": 1, "dealCount": 0, "recommendedCount": 0},
+    }
+
+    verified = app_module.verify_result_hotel_names(object(), result, "2026-06-01")
+
+    assert verified["allHotels"][0]["hotelName"] == "深圳携程酒店12345"
+    assert "nameProcessing" not in verified["allHotels"][0]
+    assert verified["summary"]["nameVerificationComplete"] is True
+    assert verified["summary"]["nameVerificationRemainingCount"] == 0
+
+
+def test_verified_hotel_name_is_cached_and_reused(monkeypatch, tmp_path):
+    app_module = importlib.import_module("app")
+    monkeypatch.setattr(app_module, "HOTEL_NAME_CACHE_PATH", tmp_path / "hotel_name_cache.json")
+    with app_module.HOTEL_NAME_CACHE_LOCK:
+        app_module.HOTEL_NAME_MEMORY_CACHE = {"byHotelId": {}, "byNameKey": {}}
+        app_module.HOTEL_NAME_CACHE_LOADED = False
+
+    hotel = {
+        "hotelId": "name-cache-1",
+        "hotelName": "深圳星级酒店（中文名正在核验中...）",
+        "hotelOriginalName": "Raw Cache Hotel",
+        "city": "深圳",
+        "nameProcessing": True,
+    }
+    payload = {
+        "hotelName": "深圳中文名缓存酒店",
+        "hotelOriginalName": "Raw Cache Hotel",
+        "hotelNameSimplified": "深圳中文名缓存酒店",
+        "hotelNameSource": "携程中文页",
+    }
+
+    app_module.cache_hotel_name_payload(hotel, payload, "tripcom")
+    result = {
+        "query": {"city": "深圳", "sortBy": "discount"},
+        "targetHotel": {},
+        "compareDates": ["2026-06-01"],
+        "allHotels": [
+            {
+                **hotel,
+                "starRating": 4,
+                "distanceKm": 1.2,
+                "currentPrice": 520,
+                "isDeal": False,
+                "isRecommendedBrand": False,
+            }
+        ],
+        "dealHotels": [],
+        "recommendedHotels": [],
+        "summary": {"partial": True, "candidateCount": 1},
+    }
+
+    updated = app_module.apply_cached_hotel_names_to_result(result, "tripcom")
+
+    assert updated["allHotels"][0]["hotelName"] == "深圳中文名缓存酒店"
+    assert updated["allHotels"][0]["hotelNameSource"] == "携程中文页"
+    assert "nameProcessing" not in updated["allHotels"][0]
+    assert updated["summary"]["nameCacheHit"] is True
+
+
+def test_apply_sort_repairs_cached_brand_labels():
+    app_module = importlib.import_module("app")
+    cached = {
+        "query": {"city": "广州", "sortBy": "discount"},
+        "targetHotel": {},
+        "compareDates": ["2026-06-01"],
+        "allHotels": [
+            {
+                "hotelId": "w-guangzhou",
+                "hotelName": "W Guangzhou",
+                "hotelOriginalName": "W Guangzhou",
+                "brand": "独立酒店",
+                "brandLabel": "独立酒店",
+                "brandRank": 99,
+                "isRecommendedBrand": False,
+                "starRating": 5,
+                "distanceKm": 1.5,
+                "currentPrice": 1200,
+                "isDeal": False,
+            },
+            {
+                "hotelId": "intercity-guangzhou",
+                "hotelName": "广州珠江新城城际酒店",
+                "brand": "独立酒店",
+                "brandLabel": "独立酒店",
+                "brandRank": 99,
+                "isRecommendedBrand": False,
+                "starRating": 4,
+                "distanceKm": 1.0,
+                "currentPrice": 520,
+                "isDeal": False,
+            },
+        ],
+        "dealHotels": [],
+        "recommendedHotels": [],
+        "summary": {"candidateCount": 2, "recommendedCount": 0},
+    }
+
+    repaired = app_module.apply_sort_to_result(cached, "discount")
+    by_id = {hotel["hotelId"]: hotel for hotel in repaired["allHotels"]}
+
+    assert by_id["w-guangzhou"]["brandLabel"] == "万豪"
+    assert by_id["w-guangzhou"]["groupLabel"] == "万豪国际"
+    assert by_id["w-guangzhou"]["isRecommendedBrand"] is True
+    assert repaired["recommendedHotels"][0]["hotelId"] == "w-guangzhou"
+    assert by_id["intercity-guangzhou"]["brandLabel"] == "华住"
+    assert by_id["intercity-guangzhou"]["groupLabel"] == "华住集团"
+    assert by_id["intercity-guangzhou"]["isRecommendedBrand"] is False
+
+
+def test_background_search_starts_name_verification_from_first_partial(monkeypatch, tmp_path):
+    app_module = importlib.import_module("app")
+    monkeypatch.setattr(app_module, "SEARCH_CACHE_DIR", tmp_path / "search_cache")
+    monkeypatch.setattr(app_module, "HOT_SEARCH_PATH", tmp_path / "hot_searches.json")
+    monkeypatch.setattr(app_module, "HOTEL_NAME_CACHE_PATH", tmp_path / "hotel_name_cache.json")
+    app_module.SEARCH_CACHE.clear()
+    app_module.SEARCH_JOBS.clear()
+    with app_module.HOTEL_NAME_CACHE_LOCK:
+        app_module.HOTEL_NAME_MEMORY_CACHE = {"byHotelId": {}, "byNameKey": {}}
+        app_module.HOTEL_NAME_CACHE_LOADED = False
+    verify_started = threading.Event()
+
+    payload = {
+        "city": "深圳",
+        "targetHotel": "深圳国际会展中心",
+        "selectedDate": "2026-06-01",
+        "radiusKm": "5",
+        "minStar": "4",
+        "provider": "tripcom",
+        "sortBy": "discount",
+    }
+
+    def pending_result(partial: bool) -> dict:
+        return {
+            "query": {"city": "深圳", "sortBy": "discount"},
+            "targetHotel": {"hotelId": "target", "hotelName": "深圳国际会展中心", "searchType": "LM"},
+            "compareDates": ["2026-06-01", "2026-06-02"],
+            "allHotels": [
+                {
+                    "hotelId": "name-1",
+                    "hotelName": "深圳星级酒店（中文名正在核验中...）",
+                    "hotelOriginalName": "Raw Hotel Name",
+                    "hotelNameSource": "本地中文名兜底（原名正在核验中）",
+                    "city": "深圳",
+                    "starRating": 4,
+                    "distanceKm": 1.2,
+                    "currentPrice": 520,
+                    "isDeal": False,
+                    "isRecommendedBrand": False,
+                    "nameProcessing": True,
+                }
+            ],
+            "dealHotels": [],
+            "recommendedHotels": [],
+            "summary": {
+                "partial": partial,
+                "candidateCount": 1,
+                "dealCount": 0,
+                "recommendedCount": 0,
+                "source": "Trip.com 实时抓取",
+            },
+        }
+
+    class FakeProvider:
+        source_name = "Trip.com 实时抓取"
+
+        def verify_hotel_names(self, hotels, selected_date, progress_callback=None, lightweight_only=False):
+            assert lightweight_only is True
+            verify_started.set()
+            payload = {
+                "hotelName": "深圳测试酒店",
+                "hotelOriginalName": "Raw Hotel Name",
+                "hotelNameSimplified": "深圳测试酒店",
+                "hotelNameSource": "测试中文名来源",
+            }
+            if progress_callback:
+                progress_callback({"phase": "resolved", "hotelId": "name-1", "completed": 1, "total": 1, "payload": payload})
+            return {"name-1": payload}
+
+    monkeypatch.setattr(app_module, "provider_from_name", lambda app_dir, provider_name: FakeProvider())
+    monkeypatch.setattr(app_module, "search_current_prices", lambda **kwargs: pending_result(partial=True))
+
+    def fake_search_deals(**kwargs):
+        assert verify_started.wait(2)
+        return pending_result(partial=False)
+
+    monkeypatch.setattr(app_module, "search_deals", fake_search_deals)
+
+    key = app_module.cache_key(payload)
+    job_id = app_module.start_background_search_job(payload, key, "tripcom", force_refresh=True)
+    deadline = time.time() + 4
+    job = {}
+    while time.time() < deadline:
+        with app_module.SEARCH_JOB_LOCK:
+            job = dict(app_module.SEARCH_JOBS.get(job_id) or {})
+        if job.get("status") in {"complete", "error"}:
+            break
+        time.sleep(0.05)
+
+    assert verify_started.is_set()
+    assert job.get("status") == "complete", job
+    assert job["result"]["allHotels"][0]["hotelName"] == "深圳测试酒店"
 
 
 def test_stale_tripcom_cache_returns_immediately_and_refreshes(monkeypatch, tmp_path):

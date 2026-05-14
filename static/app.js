@@ -20,6 +20,7 @@ const recommendList = document.getElementById("recommend-list");
 const hotelFilters = {
   candidate: {
     keyword: document.getElementById("candidate-filter-keyword"),
+    sort: document.getElementById("candidate-filter-sort"),
     minPrice: document.getElementById("candidate-filter-min-price"),
     maxPrice: document.getElementById("candidate-filter-max-price"),
     reset: document.getElementById("candidate-filter-reset"),
@@ -27,6 +28,7 @@ const hotelFilters = {
   },
   recommend: {
     keyword: document.getElementById("recommend-filter-keyword"),
+    sort: document.getElementById("recommend-filter-sort"),
     minPrice: document.getElementById("recommend-filter-min-price"),
     maxPrice: document.getElementById("recommend-filter-max-price"),
     reset: document.getElementById("recommend-filter-reset"),
@@ -93,6 +95,16 @@ function containsChineseText(text) {
   return /[\u3400-\u9fff]/.test(String(text || ""));
 }
 
+function hasNameVerificationMarker(text) {
+  return /中文名(?:待核验|正在核验中)/.test(String(text || ""));
+}
+
+function normalizeNameVerificationText(text) {
+  return String(text || "")
+    .replace(/（\s*中文名待核验\s*）/g, "（中文名正在核验中...）")
+    .replace(/（\s*中文名正在核验中\.*\s*）/g, "（中文名正在核验中...）");
+}
+
 function fallbackChineseHotelName(hotel) {
   if (!hotel) return "";
   const city = simplifyChineseText(hotel.city || latestData?.query?.city || "").trim();
@@ -102,11 +114,11 @@ function fallbackChineseHotelName(hotel) {
     ? brand.replace(/集团$/, "")
     : "";
   if (brandText && brandText.endsWith("酒店")) {
-    return `${cityPrefix && !brandText.startsWith(cityPrefix) ? cityPrefix : ""}${brandText}（中文名待核验）`;
+    return `${cityPrefix && !brandText.startsWith(cityPrefix) ? cityPrefix : ""}${brandText}（中文名正在核验中...）`;
   }
-  if (brandText) return `${cityPrefix}${brandText}酒店（中文名待核验）`;
-  if (cityPrefix) return `${cityPrefix}星级酒店（中文名待核验）`;
-  if (hotel.hotelId) return "星级酒店（中文名待核验）";
+  if (brandText) return `${cityPrefix}${brandText}酒店（中文名正在核验中...）`;
+  if (cityPrefix) return `${cityPrefix}星级酒店（中文名正在核验中...）`;
+  if (hotel.hotelId) return "星级酒店（中文名正在核验中...）";
   return "";
 }
 
@@ -118,7 +130,7 @@ function displayHotelName(hotel) {
   ];
   for (const candidate of candidates) {
     const name = simplifyChineseText(candidate || "").trim();
-    if (name && containsChineseText(name)) return name;
+    if (name && containsChineseText(name)) return normalizeNameVerificationText(name);
   }
   return fallbackChineseHotelName(hotel);
 }
@@ -169,6 +181,16 @@ function tripLink(hotel) {
   `;
 }
 
+function nameVerificationBar(hotel) {
+  if (!hotel.nameProcessing && !hasNameVerificationMarker(hotel.hotelName)) return "";
+  return `
+    <div class="name-verification">
+      <span>正在核验酒店中文名，核验完成后会自动刷新标题</span>
+      <i aria-hidden="true"></i>
+    </div>
+  `;
+}
+
 function hotelCard(hotel, mode) {
   const badgeText = mode === "deal"
     ? `便宜 ${currency(hotel.discountAmount)}`
@@ -194,6 +216,7 @@ function hotelCard(hotel, mode) {
           <span class="deal-badge">${badgeText}</span>
         </div>
         <div class="hotel-meta">${hotelMeta(hotel)}</div>
+        ${nameVerificationBar(hotel)}
         <div class="price-grid">
           <div class="price-cell">
             <span>目标日期价格</span>
@@ -305,11 +328,23 @@ function setCompareNotice(text) {
 }
 
 function sortedHotels(items, mode, summary = {}) {
-  if (summary.sortDeferred) return [...(items || [])];
-  const sortBy = form.elements.sortBy.value || "discount";
+  if (summary.sortDeferred && mode === "deal") return [...(items || [])];
+  const sectionSort = hotelFilters[mode]?.sort?.value || "distance";
+  const sortBy = mode === "candidate" || mode === "recommend"
+    ? sectionSort
+    : (form.elements.sortBy.value || "discount");
   const hotels = [...(items || [])];
-  const price = (hotel) => Number(hotel.currentPrice || 1000000000);
-  const distance = (hotel) => Number(hotel.distanceKm || 999);
+  const price = (hotel) => {
+    if (hotel.currentPrice === null || hotel.currentPrice === undefined || hotel.currentPrice === "") {
+      return 1000000000;
+    }
+    const value = Number(hotel.currentPrice);
+    return Number.isFinite(value) ? value : 1000000000;
+  };
+  const distance = (hotel) => {
+    const value = Number(hotel.distanceKm);
+    return Number.isFinite(value) ? value : 999;
+  };
   const star = (hotel) => Number(hotel.starRating || 0);
   const discount = (hotel) => Number(hotel.discountAmount || 0);
   const brandRank = (hotel) => Number(hotel.brandRank || 99);
@@ -318,13 +353,13 @@ function sortedHotels(items, mode, summary = {}) {
     return hotels.sort((a, b) => price(a) - price(b) || distance(a) - distance(b));
   }
   if (sortBy === "distance") {
-    return hotels.sort((a, b) => distance(a) - distance(b) || price(a) - price(b));
+    return hotels.sort((a, b) => distance(a) - distance(b) || star(b) - star(a) || price(a) - price(b));
   }
   if (sortBy === "star") {
     return hotels.sort((a, b) => star(b) - star(a) || price(a) - price(b));
   }
   if (mode === "recommend") {
-    return hotels.sort((a, b) => price(a) - price(b) || star(b) - star(a) || distance(a) - distance(b) || brandRank(a) - brandRank(b));
+    return hotels.sort((a, b) => distance(a) - distance(b) || star(b) - star(a) || brandRank(a) - brandRank(b) || price(a) - price(b));
   }
   return hotels.sort((a, b) => discount(b) - discount(a) || price(a) - price(b));
 }
@@ -549,10 +584,13 @@ function renderResult(data) {
   const mergeLabel = summary.mergedFromCache
     ? `｜已合并旧缓存${summary.cacheCarriedHotelCount ? `，补回 ${summary.cacheCarriedHotelCount} 家` : ""}`
     : "";
-  const partialLabel = summary.partial ? "｜已先返回候选，后台计算优惠中" : "";
+  const partialLabel = summary.partial
+    ? (progress.stage === "name-verification" ? "｜中文名核验中" : "｜已先返回候选，后台计算优惠中")
+    : "";
+  const nameLabel = summary.nameVerificationActive ? "｜中文名正在同步更新" : "";
   const progressLabel = progress.message ? `｜${progress.message}` : "";
   if (sourcePill) {
-    sourcePill.textContent = `${summary.source || "Trip.com 实时价格"}${expanded}${compareLabel}${cacheLabel}${mergeLabel}${partialLabel}${progressLabel}`;
+    sourcePill.textContent = `${summary.source || "Trip.com 实时价格"}${expanded}${compareLabel}${cacheLabel}${mergeLabel}${partialLabel}${nameLabel}${progressLabel}`;
   }
 
   const deals = chineseNamedHotels(sortedHotels(data.dealHotels, "deal", summary));
@@ -748,8 +786,12 @@ for (const [mode, controls] of Object.entries(hotelFilters)) {
       else updateHotelFilterCount(mode, 0, 0);
     });
   });
+  controls.sort?.addEventListener("change", () => {
+    if (latestData) renderResult(latestData);
+  });
   controls.reset?.addEventListener("click", () => {
     if (controls.keyword) controls.keyword.value = "";
+    if (controls.sort) controls.sort.value = "distance";
     if (controls.minPrice) controls.minPrice.value = "";
     if (controls.maxPrice) controls.maxPrice.value = "";
     if (latestData) renderResult(latestData);

@@ -237,3 +237,167 @@ class MySQLSearchCache:
             "target_hotel": str(payload.get("targetHotel") or ""),
             "selected_date": str(payload.get("selectedDate") or ""),
         }
+
+
+@dataclass
+class MySQLHotelNameCache(MySQLSearchCache):
+    table: str = "hotel_name_cache"
+
+    @classmethod
+    def from_env(cls) -> "MySQLHotelNameCache":
+        enabled_value = os.environ.get("HOTEL_DEAL_MYSQL_ENABLED", "auto").strip().lower()
+        enabled = enabled_value not in {"0", "false", "no", "off", "disabled"}
+        return cls(
+            host=os.environ.get("HOTEL_DEAL_MYSQL_HOST", "127.0.0.1"),
+            port=int(os.environ.get("HOTEL_DEAL_MYSQL_PORT", "3306")),
+            user=os.environ.get("HOTEL_DEAL_MYSQL_USER", "root"),
+            password=os.environ.get("HOTEL_DEAL_MYSQL_PASSWORD", ""),
+            database=os.environ.get("HOTEL_DEAL_MYSQL_DATABASE", "star_hotel_deal_app"),
+            table=os.environ.get("HOTEL_DEAL_MYSQL_NAME_TABLE", "hotel_name_cache"),
+            enabled=enabled,
+            connect_timeout=float(os.environ.get("HOTEL_DEAL_MYSQL_CONNECT_TIMEOUT", "1")),
+            read_timeout=float(os.environ.get("HOTEL_DEAL_MYSQL_READ_TIMEOUT", "2")),
+            write_timeout=float(os.environ.get("HOTEL_DEAL_MYSQL_WRITE_TIMEOUT", "2")),
+            cooldown_seconds=float(os.environ.get("HOTEL_DEAL_MYSQL_ERROR_COOLDOWN_SECONDS", "60")),
+        )
+
+    def get(self, provider: str, *, hotel_id: str = "", original_name_key: str = "") -> dict[str, Any] | None:
+        if not self.available():
+            return None
+        now = time.time()
+        try:
+            self.ensure_schema()
+            with self.connect() as connection:
+                with connection.cursor() as cursor:
+                    row = None
+                    if hotel_id:
+                        cursor.execute(
+                            f"""
+                            SELECT payload_json, expires_at
+                            FROM `{self.table}`
+                            WHERE provider = %s AND hotel_id = %s AND expires_at >= %s
+                            ORDER BY updated_at DESC
+                            LIMIT 1
+                            """,
+                            (provider, hotel_id, now),
+                        )
+                        row = cursor.fetchone()
+                    if row is None and original_name_key:
+                        cursor.execute(
+                            f"""
+                            SELECT payload_json, expires_at
+                            FROM `{self.table}`
+                            WHERE provider = %s AND original_name_key = %s AND expires_at >= %s
+                            ORDER BY updated_at DESC
+                            LIMIT 1
+                            """,
+                            (provider, original_name_key, now),
+                        )
+                        row = cursor.fetchone()
+                    if not row:
+                        return None
+                    cache_hash = cache_digest(f"{provider}:{hotel_id or original_name_key}")
+                    cursor.execute(
+                        f"""
+                        UPDATE `{self.table}`
+                        SET hit_count = hit_count + 1, last_hit_at = %s
+                        WHERE cache_hash = %s
+                        """,
+                        (now, cache_hash),
+                    )
+            payload = json.loads(row["payload_json"])
+            return payload if isinstance(payload, dict) else None
+        except Exception as exc:  # pragma: no cover - depends on local MySQL
+            self.remember_error(exc)
+            return None
+
+    def store(
+        self,
+        provider: str,
+        *,
+        hotel_id: str,
+        original_name: str,
+        original_name_key: str,
+        payload: dict[str, Any],
+        expires_at: float,
+    ) -> None:
+        if not self.available():
+            return
+        cache_hash = cache_digest(f"{provider}:{hotel_id or original_name_key}")
+        now = time.time()
+        try:
+            self.ensure_schema()
+            with self.connect() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        f"""
+                        INSERT INTO `{self.table}` (
+                            cache_hash, provider, hotel_id, original_name_key,
+                            original_name, hotel_name, hotel_name_source, payload_json,
+                            created_at, updated_at, expires_at, last_hit_at, hit_count
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, 0)
+                        ON DUPLICATE KEY UPDATE
+                            original_name_key = VALUES(original_name_key),
+                            original_name = VALUES(original_name),
+                            hotel_name = VALUES(hotel_name),
+                            hotel_name_source = VALUES(hotel_name_source),
+                            payload_json = VALUES(payload_json),
+                            updated_at = VALUES(updated_at),
+                            expires_at = VALUES(expires_at)
+                        """,
+                        (
+                            cache_hash,
+                            provider,
+                            hotel_id,
+                            original_name_key,
+                            original_name,
+                            str(payload.get("hotelName") or ""),
+                            str(payload.get("hotelNameSource") or payload.get("source") or ""),
+                            json.dumps(payload, ensure_ascii=False),
+                            now,
+                            now,
+                            expires_at,
+                        ),
+                    )
+                    cursor.execute(f"DELETE FROM `{self.table}` WHERE expires_at < %s", (now,))
+        except Exception as exc:  # pragma: no cover - depends on local MySQL
+            self.remember_error(exc)
+
+    def ensure_schema(self) -> None:
+        if self._schema_ready:
+            return
+        with self.connect(use_database=False) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    CREATE DATABASE IF NOT EXISTS `{self.database}`
+                    CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+                    """
+                )
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS `{self.table}` (
+                        cache_hash CHAR(64) NOT NULL PRIMARY KEY,
+                        provider VARCHAR(32) NOT NULL,
+                        hotel_id VARCHAR(64) NOT NULL,
+                        original_name_key CHAR(64) NULL,
+                        original_name VARCHAR(255) NULL,
+                        hotel_name VARCHAR(255) NOT NULL,
+                        hotel_name_source VARCHAR(128) NULL,
+                        payload_json MEDIUMTEXT NOT NULL,
+                        created_at DOUBLE NOT NULL,
+                        updated_at DOUBLE NOT NULL,
+                        expires_at DOUBLE NOT NULL,
+                        last_hit_at DOUBLE NULL,
+                        hit_count INT NOT NULL DEFAULT 0,
+                        INDEX idx_provider_hotel (provider, hotel_id),
+                        INDEX idx_provider_name_key (provider, original_name_key),
+                        INDEX idx_updated_at (updated_at),
+                        INDEX idx_expires_at (expires_at)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                    """
+                )
+        self._schema_ready = True

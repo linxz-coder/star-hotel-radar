@@ -15,6 +15,8 @@ class HotelDealError(RuntimeError):
 
 
 DEFAULT_HOLIDAY_CALENDAR = HolidayCalendar()
+NAME_VERIFICATION_SUFFIX = "（中文名正在核验中...）"
+NAME_VERIFICATION_MARKERS = ("中文名待核验", "中文名正在核验中")
 
 BRAND_DEFINITIONS: list[dict[str, Any]] = [
     {
@@ -52,6 +54,11 @@ BRAND_DEFINITIONS: list[dict[str, Any]] = [
             "le meridien",
             "艾美",
             "w hotel",
+            "w hotels",
+            "w guangzhou",
+            "guangzhou w",
+            "w shanghai",
+            "shanghai w",
             "w酒店",
             "w 广州",
             "w上海",
@@ -170,6 +177,9 @@ CHAIN_BRAND_DEFINITIONS: list[dict[str, Any]] = [
             "海友",
             "宜必思",
             "ibis",
+            "城际酒店",
+            "intercityhotel",
+            "intercity hotel",
         ),
     },
     {
@@ -728,7 +738,19 @@ def hotel_brand_payload(hotel: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
-def fallback_chinese_hotel_name(hotel: dict[str, Any], *, city: str = "") -> str:
+def has_name_verification_marker(value: Any) -> bool:
+    text = str(value or "")
+    return any(marker in text for marker in NAME_VERIFICATION_MARKERS)
+
+
+def strip_name_verification_marker(value: Any) -> str:
+    text = str(value or "")
+    for marker in NAME_VERIFICATION_MARKERS:
+        text = re.sub(rf"[（(]\s*{re.escape(marker)}\.*\s*[）)]", "", text)
+    return text.strip()
+
+
+def fallback_chinese_hotel_name(hotel: dict[str, Any], *, city: str = "", pending: bool = True) -> str:
     city_name = simplify_chinese_text(city or hotel.get("city") or "").strip()
     if not contains_chinese_text(city_name):
         city_name = ""
@@ -744,10 +766,12 @@ def fallback_chinese_hotel_name(hotel: dict[str, Any], *, city: str = "") -> str
     elif brand_label:
         core = f"{city_name}{brand_label}酒店" if city_name else f"{brand_label}酒店"
     elif city_name:
-        core = f"{city_name}星级酒店"
+        hotel_id = str(hotel.get("hotelId") or "").strip()
+        core = f"{city_name}星级酒店" if pending or not hotel_id else f"{city_name}携程酒店{hotel_id}"
     else:
-        core = "星级酒店"
-    return f"{core}（中文名待核验）"
+        hotel_id = str(hotel.get("hotelId") or "").strip()
+        core = "星级酒店" if pending or not hotel_id else f"携程酒店{hotel_id}"
+    return f"{core}{NAME_VERIFICATION_SUFFIX if pending else ''}"
 
 
 def hotel_result_payload(
@@ -835,18 +859,18 @@ def normalize_result_hotel_name(hotel: dict[str, Any], *, city: str = "") -> dic
             item.get("hotelOriginalName"),
         ],
         hotel_id=hotel_id,
-        source=str(item.get("source") or ""),
+        source=str(item.get("hotelNameSource") or item.get("source") or ""),
     )
     item.update(payload)
     item["city"] = simplify_chinese_text(item.get("city") or city or "")
-    if not has_displayable_chinese_hotel_name(item):
+    if has_name_verification_marker(item.get("hotelName")) or not has_resolved_chinese_hotel_name(item):
         fallback_name = fallback_chinese_hotel_name(item, city=city)
         item["hotelName"] = fallback_name
         item["hotelNameSimplified"] = fallback_name
         item["hotelOriginalName"] = original_name
-        item["hotelNameSource"] = "本地中文名兜底（原名待核验）"
+        item["hotelNameSource"] = "本地中文名兜底（原名正在核验中）"
         item["nameProcessing"] = True
-    elif item.get("hotelNameSource") != "本地中文名兜底（原名待核验）":
+    elif item.get("hotelNameSource") != "本地中文名兜底（原名正在核验中）":
         item.pop("nameProcessing", None)
     return item
 
@@ -860,6 +884,72 @@ def has_displayable_chinese_hotel_name(hotel: dict[str, Any]) -> bool:
             hotel.get("hotelOriginalName"),
         )
     )
+
+
+def has_resolved_chinese_hotel_name(hotel: dict[str, Any]) -> bool:
+    return any(
+        contains_chinese_text(simplify_chinese_text(value)) and not has_name_verification_marker(value)
+        for value in (
+            hotel.get("hotelName"),
+            hotel.get("hotelNameSimplified"),
+            hotel.get("hotelOriginalName"),
+        )
+    )
+
+
+def hotel_name_needs_verification(hotel: dict[str, Any]) -> bool:
+    source = str(hotel.get("hotelNameSource") or "")
+    return bool(
+        hotel.get("nameProcessing")
+        or "正在核验" in source
+        or "待核验" in source
+        or has_name_verification_marker(hotel.get("hotelName"))
+        or has_name_verification_marker(hotel.get("hotelNameSimplified"))
+    )
+
+
+def apply_verified_hotel_name_payload(
+    hotel: dict[str, Any],
+    payload: dict[str, Any],
+    *,
+    city: str = "",
+) -> dict[str, Any]:
+    item = dict(hotel)
+    item["hotelName"] = str(payload.get("hotelName") or payload.get("name") or item.get("hotelName") or "").strip()
+    item["hotelOriginalName"] = str(payload.get("hotelOriginalName") or item.get("hotelOriginalName") or "").strip()
+    item["hotelNameSimplified"] = str(payload.get("hotelNameSimplified") or item.get("hotelName") or "").strip()
+    item["hotelNameSource"] = str(payload.get("hotelNameSource") or payload.get("source") or "中文名核验完成").strip()
+    item.pop("nameProcessing", None)
+    return normalize_result_hotel_name(item, city=city)
+
+
+def finalize_pending_hotel_name(hotel: dict[str, Any], *, city: str = "") -> dict[str, Any]:
+    item = dict(hotel)
+    if has_resolved_chinese_hotel_name(item) and not has_name_verification_marker(item.get("hotelName")):
+        item.pop("nameProcessing", None)
+        return normalize_result_hotel_name(item, city=city)
+    original_name = strip_name_verification_marker(
+        item.get("hotelOriginalName")
+        or item.get("hotelName")
+        or item.get("hotelNameSimplified")
+        or ""
+    )
+    original_payload = hotel_name_payload_from_sources(
+        [original_name],
+        hotel_id=str(item.get("hotelId") or ""),
+        source=str(item.get("source") or "Trip.com 原始名规则转中文"),
+    )
+    if original_payload.get("hotelName") and has_resolved_chinese_hotel_name(original_payload):
+        item.update(original_payload)
+        item.pop("nameProcessing", None)
+        return normalize_result_hotel_name(item, city=city)
+    final_name = strip_name_verification_marker(fallback_chinese_hotel_name(item, city=city, pending=False))
+    item["hotelName"] = final_name
+    item["hotelNameSimplified"] = final_name
+    item["hotelOriginalName"] = original_name
+    item["hotelNameSource"] = "本地中文名兜底（未匹配到标准中文名）"
+    item.pop("nameProcessing", None)
+    return item
 
 
 def mark_hotel_name_processing_if_needed(hotel: dict[str, Any]) -> bool:

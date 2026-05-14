@@ -13,7 +13,7 @@ import threading
 import uuid
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 from hotel_deals import HotelDealError, detectHotelBrand, haversine_km, parse_date
@@ -33,6 +33,7 @@ RESULT_TYPE_LABELS = {
     "CT": "城市",
     "Z": "商圈",
 }
+NAME_VERIFICATION_MARKERS = ("中文名待核验", "中文名正在核验中")
 
 
 class ProviderError(HotelDealError):
@@ -41,6 +42,11 @@ class ProviderError(HotelDealError):
 
 def normalize_name(value: str) -> str:
     return re.sub(r"[\s·・,，.。()（）\-_/]+", "", simplify_chinese_text(value).lower())
+
+
+def has_name_verification_marker(value: Any) -> bool:
+    text = str(value or "")
+    return any(marker in text for marker in NAME_VERIFICATION_MARKERS)
 
 
 def read_json_file(path: Path) -> dict[str, Any]:
@@ -745,6 +751,113 @@ class TripComProvider:
             for hotel_id in hotel_ids
         }
 
+    def _resolved_name_payload_from_sources(
+        self,
+        sources: list[Any],
+        *,
+        hotel_id: str,
+        source: str,
+    ) -> dict[str, str] | None:
+        cleaned = [
+            str(value or "").strip()
+            for value in sources
+            if str(value or "").strip() and not has_name_verification_marker(value)
+        ]
+        if not cleaned:
+            return None
+        payload = hotel_name_payload_from_sources(cleaned, hotel_id=hotel_id, source=source)
+        name = simplify_chinese_text(payload.get("hotelNameSimplified") or payload.get("hotelName") or "")
+        if name and contains_chinese_text(name) and not has_name_verification_marker(name):
+            return payload
+        return None
+
+    def verify_hotel_names(
+        self,
+        hotels: list[dict[str, Any]],
+        selected_date: str,
+        progress_callback: Any | None = None,
+        lightweight_only: bool = False,
+    ) -> dict[str, dict[str, str]]:
+        resolved: dict[str, dict[str, str]] = {}
+        total = len(hotels)
+        for index, hotel in enumerate(hotels, start=1):
+            hotel_id = str(hotel.get("hotelId") or "").strip()
+            if not hotel_id:
+                continue
+            if progress_callback:
+                progress_callback(
+                    {
+                        "phase": "start",
+                        "hotelId": hotel_id,
+                        "completed": index - 1,
+                        "total": total,
+                        "resolvedCount": len(resolved),
+                    }
+                )
+
+            cached = self._candidate_cache.get(hotel_id) or {}
+            payload = self._resolved_name_payload_from_sources(
+                [
+                    cached.get("hotelName"),
+                    cached.get("hotelNameSimplified"),
+                    cached.get("hotelOriginalName"),
+                    hotel.get("hotelOriginalName"),
+                    hotel.get("hotelNameSimplified"),
+                    hotel.get("hotelName"),
+                ],
+                hotel_id=hotel_id,
+                source=str(cached.get("hotelNameSource") or hotel.get("hotelNameSource") or "Trip.com 中文名核验"),
+            )
+
+            if payload is None and not lightweight_only:
+                payload = self._fetch_detail_page_name_payload(hotel, selected_date)
+
+            if payload is None:
+                payload = self._fetch_ctrip_name_payload(hotel, selected_date)
+
+            if payload is None:
+                payload = self._fetch_elong_name_payload(hotel, selected_date)
+
+            if payload is None:
+                payload = self._fetch_map_poi_name_payload(hotel)
+
+            if payload is None:
+                payload = self._fetch_search_engine_name_payload(hotel)
+
+            if payload:
+                resolved[hotel_id] = payload
+                if progress_callback:
+                    progress_callback(
+                        {
+                            "phase": "resolved",
+                            "hotelId": hotel_id,
+                            "completed": index,
+                            "total": total,
+                            "resolvedCount": len(resolved),
+                            "payload": payload,
+                        }
+                    )
+            elif progress_callback:
+                progress_callback(
+                    {
+                        "phase": "unresolved",
+                        "hotelId": hotel_id,
+                        "completed": index,
+                        "total": total,
+                        "resolvedCount": len(resolved),
+                    }
+                )
+        if progress_callback:
+            progress_callback(
+                {
+                    "phase": "complete",
+                    "completed": total,
+                    "total": total,
+                    "resolvedCount": len(resolved),
+                }
+            )
+        return resolved
+
     def get_hotel_prices(
         self,
         hotel_ids: list[str],
@@ -1006,6 +1119,529 @@ class TripComProvider:
             )
         )
         return seeds
+
+    def _source_name_terms(self, hotel: dict[str, Any]) -> list[str]:
+        terms: list[str] = []
+        for value in (
+            hotel.get("hotelOriginalName"),
+            hotel.get("hotelNameSimplified"),
+            hotel.get("hotelName"),
+            hotel.get("brandLabel"),
+            hotel.get("brand"),
+        ):
+            text = str(value or "").strip()
+            if text and not has_name_verification_marker(text):
+                terms.append(text)
+        seen: set[str] = set()
+        result: list[str] = []
+        for term in terms:
+            key = normalize_name(term)
+            if key and key not in seen:
+                seen.add(key)
+                result.append(term)
+        return result
+
+    def _name_payload_from_text_candidates(
+        self,
+        candidates: list[Any],
+        *,
+        hotel_id: str,
+        source: str,
+        expected_city: str = "",
+    ) -> dict[str, str] | None:
+        cleaned: list[str] = []
+        city = simplify_chinese_text(expected_city or "")
+        for candidate in candidates:
+            text = html_lib.unescape(str(candidate or ""))
+            text = simplify_chinese_text(text)
+            text = re.sub(r"<[^>]+>", " ", text)
+            text = re.sub(r"\s+", " ", text).strip()
+            text = re.sub(r"\s*[-_｜|]\s*(Trip\.com|携程|Ctrip|Agoda|Booking).*$", "", text, flags=re.IGNORECASE)
+            text = re.sub(r"(预订|价格|地址|电话|点评|查询).*$", "", text).strip()
+            if not (2 <= len(text) <= 90) or not contains_chinese_text(text):
+                continue
+            if has_name_verification_marker(text):
+                continue
+            has_hotel_word = bool(re.search(r"酒店|大酒店|饭店|宾馆|公寓|度假|民宿|客栈|旅店|希尔顿|万豪|洲际|凯悦|亚朵|全季|维也纳|格兰云天|温德姆|华美达", text))
+            if not has_hotel_word and city and city not in text:
+                continue
+            cleaned.append(text)
+        return self._resolved_name_payload_from_sources(cleaned, hotel_id=hotel_id, source=source)
+
+    def _http_text(self, url: str, *, timeout: int = 8) -> str:
+        request = Request(
+            url,
+            headers={
+                "User-Agent": UA,
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.6",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            },
+        )
+        with urlopen(request, timeout=timeout) as response:
+            raw = response.read(1_200_000)
+        return raw.decode("utf-8", errors="ignore")
+
+    def _http_json(self, url: str, *, timeout: int = 8) -> dict[str, Any]:
+        request = Request(
+            url,
+            headers={
+                "User-Agent": UA,
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.6",
+                "Accept": "application/json,text/plain,*/*",
+            },
+        )
+        with urlopen(request, timeout=timeout) as response:
+            raw = response.read(1_200_000)
+        data = json.loads(raw.decode("utf-8", errors="ignore"))
+        return data if isinstance(data, dict) else {}
+
+    def _extract_html_name_candidates(self, html: str) -> list[str]:
+        candidates: list[str] = []
+        patterns = [
+            r"<title[^>]*>(.*?)</title>",
+            r"<meta[^>]+(?:property|name)=[\"'](?:og:title|title)[\"'][^>]+content=[\"']([^\"']+)[\"']",
+            r"<meta[^>]+content=[\"']([^\"']+)[\"'][^>]+(?:property|name)=[\"'](?:og:title|title)[\"']",
+            r'"hotelName"\s*:\s*"([^"]+)"',
+            r'"name"\s*:\s*"([^"]{2,100})"',
+            r'"cnName"\s*:\s*"([^"]+)"',
+            r'"chineseName"\s*:\s*"([^"]+)"',
+        ]
+        for pattern in patterns:
+            candidates.extend(re.findall(pattern, html, flags=re.IGNORECASE | re.DOTALL))
+        return candidates
+
+    def _fetch_ctrip_name_payload(self, hotel: dict[str, Any], selected_date: str) -> dict[str, str] | None:
+        hotel_id = str(hotel.get("hotelId") or "").strip()
+        if not hotel_id.isdigit():
+            return None
+        checkin_date = parse_date(selected_date)
+        checkout_date = checkin_date + dt.timedelta(days=1)
+        urls = [
+            f"https://hotels.ctrip.com/hotels/{hotel_id}.html",
+            "https://hotels.ctrip.com/hotels/detail/?" + urlencode(
+                {
+                    "hotelId": hotel_id,
+                    "checkin": checkin_date.isoformat(),
+                    "checkout": checkout_date.isoformat(),
+                }
+            ),
+        ]
+        city = simplify_chinese_text(hotel.get("city") or (self._last_target or {}).get("city") or "")
+        for url in urls:
+            try:
+                html = self._http_text(url, timeout=8)
+            except Exception:
+                continue
+            payload = self._name_payload_from_text_candidates(
+                self._extract_html_name_candidates(html),
+                hotel_id=hotel_id,
+                source="携程中文页",
+                expected_city=city,
+            )
+            if payload:
+                return payload
+        return None
+
+    def _fetch_elong_name_payload(self, hotel: dict[str, Any], selected_date: str) -> dict[str, str] | None:
+        config = self._elong_config()
+        if not config:
+            return None
+        hotel_id = str(hotel.get("hotelId") or "").strip()
+        city = simplify_chinese_text(hotel.get("city") or (self._last_target or {}).get("city") or "")
+        region_id = self._elong_region_id(city, hotel)
+        if not region_id:
+            return None
+
+        checkin_date = parse_date(selected_date)
+        checkout_date = checkin_date + dt.timedelta(days=1)
+        request_payload: dict[str, Any] = {
+            "regionId": int(region_id) if str(region_id).isdigit() else region_id,
+            "checkInDate": checkin_date.isoformat(),
+            "checkOutDate": checkout_date.isoformat(),
+            "pageIndex": 1,
+            "pageSize": int(os.environ.get("HOTEL_DEAL_ELONG_PAGE_SIZE", "10") or "10"),
+        }
+        latitude = self._coerce_float_value(hotel.get("latitude"))
+        longitude = self._coerce_float_value(hotel.get("longitude"))
+        if latitude is not None and longitude is not None:
+            request_payload.update(
+                {
+                    "latitude": latitude,
+                    "longitude": longitude,
+                    "searchRadius": int(os.environ.get("HOTEL_DEAL_ELONG_SEARCH_RADIUS_METERS", "1200") or "1200"),
+                }
+            )
+
+        terms = self._source_name_terms(hotel)
+        if terms:
+            request_payload["propertyName"] = terms[0]
+
+        try:
+            data = self._elong_request(config, request_payload)
+        except Exception:
+            return None
+
+        rows = self._extract_elong_hotel_rows(data)
+        if not rows:
+            return None
+        row = self._best_elong_hotel_row(rows, hotel, city=city)
+        if not row:
+            return None
+
+        candidates = self._elong_name_candidates(row)
+        return self._name_payload_from_text_candidates(
+            candidates,
+            hotel_id=hotel_id,
+            source="艺龙中文酒店列表",
+            expected_city=city,
+        )
+
+    def _elong_config(self) -> dict[str, str] | None:
+        user = os.environ.get("HOTEL_DEAL_ELONG_USER") or os.environ.get("ELONG_USER")
+        app_key = (
+            os.environ.get("HOTEL_DEAL_ELONG_APP_KEY")
+            or os.environ.get("HOTEL_DEAL_ELONG_APPKEY")
+            or os.environ.get("ELONG_APP_KEY")
+        )
+        secret_key = (
+            os.environ.get("HOTEL_DEAL_ELONG_SECRET_KEY")
+            or os.environ.get("HOTEL_DEAL_ELONG_SECRET")
+            or os.environ.get("ELONG_SECRET_KEY")
+        )
+        if not user or not app_key or not secret_key:
+            return None
+        return {
+            "user": user,
+            "appKey": app_key,
+            "secretKey": secret_key,
+            "host": (os.environ.get("HOTEL_DEAL_ELONG_API_HOST") or "https://api.elong.com/rest").rstrip("?"),
+            "method": os.environ.get("HOTEL_DEAL_ELONG_METHOD") or "ihotel.list",
+        }
+
+    def _elong_region_id(self, city: str, hotel: dict[str, Any]) -> str:
+        for key in ("elongRegionId", "regionId", "elongCityId"):
+            value = str(hotel.get(key) or "").strip()
+            if value:
+                return value
+        mapping_text = os.environ.get("HOTEL_DEAL_ELONG_REGION_ID_MAP", "").strip()
+        mapping: dict[str, Any] = {}
+        if mapping_text:
+            try:
+                parsed = json.loads(mapping_text)
+                if isinstance(parsed, dict):
+                    mapping = parsed
+            except json.JSONDecodeError:
+                for part in re.split(r"[,;，；]\s*", mapping_text):
+                    if "=" not in part:
+                        continue
+                    name, value = part.split("=", 1)
+                    mapping[name.strip()] = value.strip()
+        city_key = normalize_name(city)
+        for name, value in mapping.items():
+            if normalize_name(name) == city_key and str(value or "").strip():
+                return str(value).strip()
+        return str(os.environ.get("HOTEL_DEAL_ELONG_DEFAULT_REGION_ID") or "").strip()
+
+    def _elong_request(self, config: dict[str, str], payload: dict[str, Any]) -> dict[str, Any]:
+        data_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        timestamp = str(int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000))
+        data_digest = hashlib.md5((data_json + config["appKey"]).encode("utf-8")).hexdigest()
+        signature = hashlib.md5((timestamp + data_digest + config["secretKey"]).encode("utf-8")).hexdigest()
+        params = {
+            "timestamp": timestamp,
+            "format": "json",
+            "method": config["method"],
+            "signature": signature,
+            "user": config["user"],
+            "data": data_json,
+        }
+        return self._http_json(config["host"] + "?" + urlencode(params), timeout=8)
+
+    def _extract_elong_hotel_rows(self, data: dict[str, Any]) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+
+        def visit(node: Any) -> None:
+            if isinstance(node, list):
+                if node and all(isinstance(row, dict) for row in node):
+                    hotelish = [
+                        row
+                        for row in node
+                        if isinstance(row, dict)
+                        and any(key in row for key in ("HotelNameCn", "HotelName", "HotelNameEn", "HotelId"))
+                    ]
+                    if hotelish:
+                        rows.extend(hotelish)
+                        return
+                for child in node:
+                    visit(child)
+            elif isinstance(node, dict):
+                for key in ("Hotels", "HotelList", "Hotel", "hotelList", "hotels"):
+                    child = node.get(key)
+                    if isinstance(child, list):
+                        visit(child)
+                for child in node.values():
+                    if isinstance(child, (dict, list)):
+                        visit(child)
+
+        visit(data)
+        seen: set[str] = set()
+        unique_rows: list[dict[str, Any]] = []
+        for row in rows:
+            key = str(row.get("HotelId") or row.get("HotelID") or row.get("HotelNameCn") or row.get("HotelName") or "")
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            unique_rows.append(row)
+        return unique_rows
+
+    def _elong_name_candidates(self, row: dict[str, Any]) -> list[str]:
+        candidates: list[str] = []
+        for key in (
+            "HotelNameCn",
+            "HotelNameCN",
+            "HotelName",
+            "NameCn",
+            "Name",
+            "AddressCn",
+            "Address",
+        ):
+            value = str(row.get(key) or "").strip()
+            if value:
+                candidates.append(value)
+        return candidates
+
+    def _best_elong_hotel_row(
+        self,
+        rows: list[dict[str, Any]],
+        hotel: dict[str, Any],
+        *,
+        city: str,
+    ) -> dict[str, Any] | None:
+        source_terms = self._source_name_terms(hotel)
+        hotel_lat = self._coerce_float_value(hotel.get("latitude"))
+        hotel_lon = self._coerce_float_value(hotel.get("longitude"))
+        best_score = 0
+        best_row: dict[str, Any] | None = None
+        for row in rows:
+            score = self._elong_row_match_score(
+                row,
+                source_terms=source_terms,
+                hotel_lat=hotel_lat,
+                hotel_lon=hotel_lon,
+                city=city,
+                brand=str(hotel.get("brandLabel") or hotel.get("brand") or ""),
+            )
+            if score > best_score:
+                best_score = score
+                best_row = row
+        return best_row if best_score >= 60 else None
+
+    def _elong_row_match_score(
+        self,
+        row: dict[str, Any],
+        *,
+        source_terms: list[str],
+        hotel_lat: float | None,
+        hotel_lon: float | None,
+        city: str,
+        brand: str,
+    ) -> int:
+        score = 0
+        row_names = [
+            str(row.get(key) or "").strip()
+            for key in ("HotelNameCn", "HotelNameCN", "HotelName", "NameCn", "Name", "HotelNameEn")
+            if str(row.get(key) or "").strip()
+        ]
+        for row_name in row_names:
+            row_key = normalize_name(row_name)
+            for term in source_terms:
+                term_key = normalize_name(term)
+                if not row_key or not term_key:
+                    continue
+                if row_key == term_key:
+                    score = max(score, 100)
+                elif row_key in term_key or term_key in row_key:
+                    score = max(score, 72)
+
+        row_coordinates = self._extract_coordinates(row)
+        if row_coordinates and hotel_lat is not None and hotel_lon is not None:
+            distance = haversine_km(hotel_lat, hotel_lon, row_coordinates[0], row_coordinates[1])
+            if distance <= 0.15:
+                score += 50
+            elif distance <= 0.35:
+                score += 40
+            elif distance <= 1:
+                score += 22
+
+        row_distance = self._coerce_float_value(row.get("Distance") or row.get("distance"))
+        if row_distance is not None:
+            distance_km = row_distance / 1000 if row_distance > 50 else row_distance
+            if distance_km <= 0.35:
+                score += 35
+            elif distance_km <= 1:
+                score += 20
+
+        combined_text = simplify_chinese_text(json.dumps(row, ensure_ascii=False))
+        city_text = simplify_chinese_text(city)
+        if city_text and city_text in combined_text:
+            score += 5
+        brand_text = simplify_chinese_text(brand)
+        if brand_text and brand_text not in {"独立酒店", "酒店", "集团"} and brand_text in combined_text:
+            score += 10
+        return score
+
+    def _fetch_map_poi_name_payload(self, hotel: dict[str, Any]) -> dict[str, str] | None:
+        amap = self._fetch_amap_poi_name_payload(hotel)
+        if amap:
+            return amap
+        return self._fetch_baidu_poi_name_payload(hotel)
+
+    def _fetch_amap_poi_name_payload(self, hotel: dict[str, Any]) -> dict[str, str] | None:
+        key = os.environ.get("HOTEL_DEAL_AMAP_KEY") or os.environ.get("AMAP_WEB_SERVICE_KEY") or os.environ.get("AMAP_KEY")
+        if not key:
+            return None
+        hotel_id = str(hotel.get("hotelId") or "").strip()
+        city = simplify_chinese_text(hotel.get("city") or (self._last_target or {}).get("city") or "")
+        candidates: list[str] = []
+        for term in self._source_name_terms(hotel)[:3]:
+            params = {
+                "key": key,
+                "keywords": term,
+                "city": city,
+                "types": "100000",
+                "offset": 8,
+                "page": 1,
+                "extensions": "base",
+            }
+            try:
+                data = self._http_json("https://restapi.amap.com/v3/place/text?" + urlencode(params), timeout=8)
+            except Exception:
+                continue
+            pois = data.get("pois") if isinstance(data.get("pois"), list) else []
+            candidates.extend(str(poi.get("name") or "") for poi in pois if isinstance(poi, dict))
+            payload = self._name_payload_from_text_candidates(candidates, hotel_id=hotel_id, source="高德地图POI", expected_city=city)
+            if payload:
+                return payload
+        return None
+
+    def _fetch_baidu_poi_name_payload(self, hotel: dict[str, Any]) -> dict[str, str] | None:
+        ak = os.environ.get("HOTEL_DEAL_BAIDU_MAP_AK") or os.environ.get("BAIDU_MAP_AK")
+        if not ak:
+            return None
+        hotel_id = str(hotel.get("hotelId") or "").strip()
+        city = simplify_chinese_text(hotel.get("city") or (self._last_target or {}).get("city") or "")
+        candidates: list[str] = []
+        for term in self._source_name_terms(hotel)[:3]:
+            params = {
+                "ak": ak,
+                "query": term,
+                "region": city or "全国",
+                "output": "json",
+                "scope": 1,
+                "page_size": 8,
+            }
+            try:
+                data = self._http_json("https://api.map.baidu.com/place/v2/search?" + urlencode(params), timeout=8)
+            except Exception:
+                continue
+            results = data.get("results") if isinstance(data.get("results"), list) else []
+            candidates.extend(str(row.get("name") or "") for row in results if isinstance(row, dict))
+            payload = self._name_payload_from_text_candidates(candidates, hotel_id=hotel_id, source="百度地图POI", expected_city=city)
+            if payload:
+                return payload
+        return None
+
+    def _fetch_search_engine_name_payload(self, hotel: dict[str, Any]) -> dict[str, str] | None:
+        if os.environ.get("HOTEL_DEAL_ENABLE_SEARCH_NAME_VERIFY", "").lower() not in {"1", "true", "yes", "on"}:
+            return None
+        hotel_id = str(hotel.get("hotelId") or "").strip()
+        city = simplify_chinese_text(hotel.get("city") or (self._last_target or {}).get("city") or "")
+        candidates: list[str] = []
+        terms = self._source_name_terms(hotel)[:2] or [str(hotel.get("hotelOriginalName") or "")]
+        for term in terms:
+            query = " ".join(value for value in (city, term, "酒店 中文名 携程") if value)
+            urls = [
+                "https://www.bing.com/search?q=" + quote(query),
+                "https://duckduckgo.com/html/?q=" + quote(query),
+            ]
+            for url in urls:
+                try:
+                    html = self._http_text(url, timeout=8)
+                except Exception:
+                    continue
+                candidates.extend(self._extract_html_name_candidates(html))
+                candidates.extend(re.findall(r"<a[^>]*>([^<]{2,100})</a>", html, flags=re.IGNORECASE))
+                payload = self._name_payload_from_text_candidates(candidates, hotel_id=hotel_id, source="搜索引擎结果", expected_city=city)
+                if payload:
+                    return payload
+        return None
+
+    def _fetch_detail_page_name_payload(self, seed_hotel: dict[str, Any], check_in: str) -> dict[str, str] | None:
+        try:
+            from playwright.sync_api import sync_playwright
+        except Exception:
+            return None
+
+        checkin_date = parse_date(check_in)
+        checkout_date = checkin_date + dt.timedelta(days=1)
+        target = self._last_target or {}
+        hotel_id = str(seed_hotel.get("hotelId") or "")
+        city_id = int(seed_hotel.get("cityId") or target.get("cityId") or 0)
+        if not hotel_id or not city_id:
+            return None
+
+        url = self._detail_v2_url(hotel_id, city_id, checkin_date, checkout_date)
+        candidates: list[str] = []
+        with self._lock:
+            try:
+                with sync_playwright() as playwright:
+                    browser = playwright.chromium.launch(
+                        headless=True,
+                        args=["--disable-blink-features=AutomationControlled"],
+                    )
+                    context = browser.new_context(
+                        user_agent=UA,
+                        locale="zh-CN",
+                        timezone_id="Asia/Shanghai",
+                        viewport={"width": 1280, "height": 1000},
+                    )
+                    context.route(
+                        "**/*",
+                        lambda route: route.abort()
+                        if route.request.resource_type in {"image", "media", "font"}
+                        else route.continue_(),
+                    )
+                    page = context.new_page()
+                    page.goto(url, wait_until="domcontentloaded", timeout=22000)
+                    page.wait_for_timeout(1200)
+                    candidates.append(page.title())
+                    for selector in ("h1", "[data-testid*='hotel']", "meta[property='og:title']"):
+                        try:
+                            if selector.startswith("meta"):
+                                values = page.locator(selector).evaluate_all("(els) => els.map((el) => el.content || '')")
+                            else:
+                                values = page.locator(selector).all_text_contents()
+                        except Exception:
+                            values = []
+                        candidates.extend(str(value or "").strip() for value in values)
+                    browser.close()
+            except Exception:
+                return None
+
+        cleaned: list[str] = []
+        for candidate in candidates:
+            text = simplify_chinese_text(candidate)
+            text = re.sub(r"\s*[-_｜|]\s*Trip\.com.*$", "", text, flags=re.IGNORECASE)
+            text = re.sub(r"\s*预订.*$", "", text)
+            text = text.strip()
+            if 2 <= len(text) <= 100:
+                cleaned.append(text)
+        return self._resolved_name_payload_from_sources(
+            cleaned,
+            hotel_id=hotel_id,
+            source="Trip.com 详情页中文名",
+        )
 
     def _fetch_hotel_detail_context_for_date(self, seed_hotel: dict[str, Any], check_in: str) -> list[dict[str, Any]]:
         try:

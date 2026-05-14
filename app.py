@@ -3,8 +3,10 @@ from __future__ import annotations
 import datetime as dt
 import copy
 import hashlib
+import inspect
 import json
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -15,14 +17,19 @@ from werkzeug.exceptions import HTTPException
 
 from hotel_deals import (
     HotelDealError,
+    apply_verified_hotel_name_payload,
+    finalize_pending_hotel_name,
     get_compare_date_info,
+    hotel_brand_payload,
+    hotel_name_needs_verification,
     normalize_result_hotel_name,
     search_current_prices,
     search_deals,
     sort_hotels,
     sort_recommended_hotels,
 )
-from mysql_cache import MySQLSearchCache
+from localization import contains_chinese_text, domestic_hotel_name_key, simplify_chinese_text
+from mysql_cache import MySQLHotelNameCache, MySQLSearchCache
 from providers import LocalJsonProvider, ProviderError, TripComProvider, provider_from_name
 
 
@@ -33,6 +40,7 @@ SEARCH_CACHE: dict[str, tuple[float, dict[str, Any], float]] = {}
 SEARCH_JOBS: dict[str, dict[str, Any]] = {}
 SEARCH_JOB_LOCK = threading.Lock()
 SEARCH_CACHE_DIR = APP_DIR / ".cache" / "search_cache"
+HOTEL_NAME_CACHE_PATH = APP_DIR / ".cache" / "hotel_name_cache.json"
 HOT_SEARCH_PATH = APP_DIR / ".cache" / "hot_searches.json"
 LOCAL_CACHE_TTL_SECONDS = int(os.environ.get("HOTEL_DEAL_LOCAL_CACHE_TTL_SECONDS", str(7 * 24 * 60 * 60)))
 TRIPCOM_CACHE_TTL_SECONDS = int(os.environ.get("HOTEL_DEAL_TRIPCOM_CACHE_TTL_SECONDS", str(7 * 24 * 60 * 60)))
@@ -41,8 +49,13 @@ CACHE_RETRY_DELAY_SECONDS = int(os.environ.get("HOTEL_DEAL_SEARCH_RETRY_DELAY_SE
 MAX_SEARCH_CACHE_ITEMS = 256
 MAX_HOT_SEARCH_RECORDS = 80
 HOT_SEARCH_TTL_SECONDS = 30 * 24 * 60 * 60
-CACHE_LOGIC_VERSION = "search_v33_preserve_and_localize_names"
+HOTEL_NAME_CACHE_TTL_SECONDS = int(os.environ.get("HOTEL_DEAL_NAME_CACHE_TTL_SECONDS", str(365 * 24 * 60 * 60)))
+CACHE_LOGIC_VERSION = "search_v34_name_verification"
 MYSQL_SEARCH_CACHE = MySQLSearchCache.from_env()
+MYSQL_HOTEL_NAME_CACHE = MySQLHotelNameCache.from_env()
+HOTEL_NAME_CACHE_LOCK = threading.RLock()
+HOTEL_NAME_MEMORY_CACHE: dict[str, dict[str, Any]] = {"byHotelId": {}, "byNameKey": {}}
+HOTEL_NAME_CACHE_LOADED = False
 TARGET_TYPE_LABELS = {"H": "酒店", "LM": "地标", "D": "地区", "CT": "城市", "Z": "商圈"}
 DEFAULT_HOT_TARGETS = [
     {"city": "深圳", "targetHotel": "深圳国际会展中心希尔顿酒店", "targetType": "酒店", "heatLabel": "热搜"},
@@ -374,18 +387,33 @@ def apply_sort_to_result(result: dict[str, Any], sort_by: str) -> dict[str, Any]
     summary = data.setdefault("summary", {})
     query_city = str((data.get("query") or {}).get("city") or "").strip()
 
+    def normalize_hotel(hotel: dict[str, Any]) -> dict[str, Any]:
+        item = normalize_result_hotel_name(hotel, city=query_city)
+        brand_payload = hotel_brand_payload(item)
+        if brand_payload:
+            item.update(
+                {
+                    "brand": brand_payload.get("brand") or item.get("brand") or "独立酒店",
+                    "brandLabel": brand_payload.get("brandLabel") or item.get("brandLabel") or "独立酒店",
+                    "group": brand_payload.get("group") or item.get("group") or "",
+                    "groupLabel": brand_payload.get("groupLabel") or item.get("groupLabel") or "",
+                    "brandRank": brand_payload.get("brandRank") or 99,
+                    "brandTier": brand_payload.get("brandTier") or item.get("brandTier") or "",
+                    "isRecommendedBrand": bool(brand_payload.get("brandRank") and brand_payload.get("brandRank") != 99),
+                }
+            )
+        return item
+
     all_hotels = [
-        normalize_result_hotel_name(hotel, city=query_city)
+        normalize_hotel(hotel)
         for hotel in list(data.get("allHotels") or [])
     ]
-    deal_hotels = [
-        normalize_result_hotel_name(hotel, city=query_city)
-        for hotel in list(data.get("dealHotels") or [])
-    ]
-    recommended_hotels = [
-        normalize_result_hotel_name(hotel, city=query_city)
-        for hotel in list(data.get("recommendedHotels") or [])
-    ]
+    if all_hotels:
+        deal_hotels = [hotel for hotel in all_hotels if hotel.get("isDeal")]
+        recommended_hotels = [hotel for hotel in all_hotels if hotel.get("isRecommendedBrand")]
+    else:
+        deal_hotels = [normalize_hotel(hotel) for hotel in list(data.get("dealHotels") or [])]
+        recommended_hotels = [normalize_hotel(hotel) for hotel in list(data.get("recommendedHotels") or [])]
     preserve_order = bool(summary.get("sortDeferred"))
     data["allHotels"] = all_hotels if preserve_order else sort_hotels(all_hotels, sort_by)
     data["dealHotels"] = deal_hotels if preserve_order else sort_hotels(deal_hotels, sort_by)
@@ -448,7 +476,8 @@ def cached_search_result(key: str, provider_name: str, sort_by: str) -> dict[str
             pass
         return None
     cache_age_seconds = max(0, round(time.time() - updated_at, 1)) if updated_at else None
-    data = apply_sort_to_result(result, sort_by)
+    data = apply_cached_hotel_names_to_result(result, provider_name)
+    data = apply_sort_to_result(data, sort_by)
     data.setdefault("summary", {})["cacheHit"] = True
     data["summary"]["cacheSource"] = cache_source
     data["summary"]["elapsedMs"] = 0
@@ -511,6 +540,8 @@ def cached_result_needs_refresh(data: dict[str, Any], provider_name: str) -> boo
     if provider_name != "tripcom" or TRIPCOM_REFRESH_AFTER_SECONDS <= 0:
         return False
     summary = data.get("summary") if isinstance(data.get("summary"), dict) else {}
+    if unique_hotels_needing_name_verification(data):
+        return True
     if summary.get("partial"):
         return True
     age = summary.get("cacheAgeSeconds")
@@ -525,6 +556,228 @@ def force_refresh_requested(payload: dict[str, Any]) -> bool:
         if key in payload:
             return parse_bool(payload.get(key), default=False)
     return False
+
+
+def load_hotel_name_cache() -> dict[str, dict[str, Any]]:
+    global HOTEL_NAME_CACHE_LOADED
+    with HOTEL_NAME_CACHE_LOCK:
+        if HOTEL_NAME_CACHE_LOADED:
+            return copy.deepcopy(HOTEL_NAME_MEMORY_CACHE)
+        try:
+            payload = json.loads(HOTEL_NAME_CACHE_PATH.read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        if isinstance(payload, dict):
+            HOTEL_NAME_MEMORY_CACHE["byHotelId"] = dict(payload.get("byHotelId") or {})
+            HOTEL_NAME_MEMORY_CACHE["byNameKey"] = dict(payload.get("byNameKey") or {})
+        HOTEL_NAME_CACHE_LOADED = True
+        return copy.deepcopy(HOTEL_NAME_MEMORY_CACHE)
+
+
+def persist_hotel_name_cache_unlocked() -> None:
+    HOTEL_NAME_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    HOTEL_NAME_CACHE_PATH.write_text(
+        json.dumps(HOTEL_NAME_MEMORY_CACHE, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def hotel_name_cache_provider(provider_name: str) -> str:
+    return canonical_provider_name(provider_name or "tripcom")
+
+
+def strip_name_status_text(value: Any) -> str:
+    text = str(value or "").strip()
+    text = re.sub(r"[（(]\s*中文名(?:正在核验中|待核验)\.*\s*[）)]", "", text)
+    return text.strip()
+
+
+def hotel_original_name_key(hotel: dict[str, Any], payload: dict[str, Any] | None = None) -> str:
+    candidates = [
+        (payload or {}).get("hotelOriginalName"),
+        hotel.get("hotelOriginalName"),
+        (payload or {}).get("hotelName"),
+        hotel.get("hotelNameSimplified"),
+        hotel.get("hotelName"),
+    ]
+    for value in candidates:
+        text = strip_name_status_text(value)
+        if not text:
+            continue
+        key = domestic_hotel_name_key(text)
+        if key and "中文名正在核验中" not in key and "中文名待核验" not in key:
+            return hashlib.sha256(key.encode("utf-8")).hexdigest()
+    return ""
+
+
+def hotel_name_payload_is_cacheable(payload: dict[str, Any]) -> bool:
+    name = simplify_chinese_text(payload.get("hotelNameSimplified") or payload.get("hotelName") or "").strip()
+    source = str(payload.get("hotelNameSource") or payload.get("source") or "")
+    if not name or not contains_chinese_text(name):
+        return False
+    if "中文名正在核验中" in name or "中文名待核验" in name:
+        return False
+    blocked_source_markers = ("本地中文名兜底", "正在核验", "待核验", "未匹配到标准中文名")
+    if any(marker in source for marker in blocked_source_markers):
+        return False
+    if re.fullmatch(r".{0,12}(星级酒店|携程酒店\d*)", name):
+        return False
+    return True
+
+
+def normalized_name_cache_payload(payload: dict[str, Any]) -> dict[str, str]:
+    name = simplify_chinese_text(payload.get("hotelNameSimplified") or payload.get("hotelName") or "").strip()
+    original = str(payload.get("hotelOriginalName") or "").strip()
+    return {
+        "hotelName": name,
+        "hotelOriginalName": original if original and original != name else "",
+        "hotelNameSimplified": name,
+        "hotelNameSource": str(payload.get("hotelNameSource") or payload.get("source") or "中文名缓存").strip(),
+    }
+
+
+def hotel_name_cache_record_payload(record: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(record, dict):
+        return None
+    try:
+        expires_at = float(record.get("expiresAt") or 0)
+    except (TypeError, ValueError):
+        return None
+    if expires_at < time.time():
+        return None
+    payload = record.get("payload") if isinstance(record.get("payload"), dict) else None
+    if payload and hotel_name_payload_is_cacheable(payload):
+        return payload
+    return None
+
+
+def cached_hotel_name_payload(hotel: dict[str, Any], provider_name: str) -> dict[str, Any] | None:
+    provider = hotel_name_cache_provider(provider_name)
+    hotel_id = str(hotel.get("hotelId") or "").strip()
+    name_key = hotel_original_name_key(hotel)
+    cache = load_hotel_name_cache()
+    now = time.time()
+    keys = []
+    if hotel_id:
+        keys.append(("byHotelId", f"{provider}:{hotel_id}"))
+    if name_key:
+        keys.append(("byNameKey", f"{provider}:{name_key}"))
+    for group, key in keys:
+        payload = hotel_name_cache_record_payload(cache.get(group, {}).get(key))
+        if payload:
+            return payload
+
+    mysql_payload = None
+    if MYSQL_HOTEL_NAME_CACHE is not None:
+        mysql_payload = MYSQL_HOTEL_NAME_CACHE.get(provider, hotel_id=hotel_id, original_name_key=name_key)
+    if mysql_payload and hotel_name_payload_is_cacheable(mysql_payload):
+        cache_hotel_name_payload(hotel, mysql_payload, provider)
+        return mysql_payload
+
+    with HOTEL_NAME_CACHE_LOCK:
+        changed = False
+        for group, key in keys:
+            record = HOTEL_NAME_MEMORY_CACHE.get(group, {}).get(key)
+            if isinstance(record, dict) and float(record.get("expiresAt") or 0) < now:
+                HOTEL_NAME_MEMORY_CACHE[group].pop(key, None)
+                changed = True
+        if changed:
+            try:
+                persist_hotel_name_cache_unlocked()
+            except OSError:
+                pass
+    return None
+
+
+def cache_hotel_name_payload(hotel: dict[str, Any], payload: dict[str, Any], provider_name: str) -> None:
+    normalized = normalized_name_cache_payload(payload)
+    if not hotel_name_payload_is_cacheable(normalized):
+        return
+    provider = hotel_name_cache_provider(provider_name)
+    hotel_id = str(hotel.get("hotelId") or "").strip()
+    name_key = hotel_original_name_key(hotel, normalized)
+    if not hotel_id and not name_key:
+        return
+    original_name = (
+        strip_name_status_text(normalized.get("hotelOriginalName"))
+        or strip_name_status_text(hotel.get("hotelOriginalName"))
+        or strip_name_status_text(hotel.get("hotelName"))
+    )
+    now = time.time()
+    expires_at = now + HOTEL_NAME_CACHE_TTL_SECONDS
+    record = {
+        "provider": provider,
+        "hotelId": hotel_id,
+        "originalNameKey": name_key,
+        "originalName": original_name,
+        "payload": normalized,
+        "updatedAt": now,
+        "expiresAt": expires_at,
+    }
+    with HOTEL_NAME_CACHE_LOCK:
+        load_hotel_name_cache()
+        if hotel_id:
+            HOTEL_NAME_MEMORY_CACHE.setdefault("byHotelId", {})[f"{provider}:{hotel_id}"] = record
+        if name_key:
+            HOTEL_NAME_MEMORY_CACHE.setdefault("byNameKey", {})[f"{provider}:{name_key}"] = record
+        try:
+            persist_hotel_name_cache_unlocked()
+        except OSError:
+            pass
+    if MYSQL_HOTEL_NAME_CACHE is not None:
+        MYSQL_HOTEL_NAME_CACHE.store(
+            provider,
+            hotel_id=hotel_id,
+            original_name=original_name,
+            original_name_key=name_key,
+            payload=normalized,
+            expires_at=expires_at,
+        )
+
+
+def remember_result_hotel_names(result: dict[str, Any], provider_name: str) -> None:
+    for list_name in ("allHotels", "dealHotels", "recommendedHotels"):
+        for hotel in result.get(list_name) or []:
+            if not isinstance(hotel, dict):
+                continue
+            payload = {
+                "hotelName": hotel.get("hotelName"),
+                "hotelOriginalName": hotel.get("hotelOriginalName"),
+                "hotelNameSimplified": hotel.get("hotelNameSimplified"),
+                "hotelNameSource": hotel.get("hotelNameSource"),
+            }
+            cache_hotel_name_payload(hotel, payload, provider_name)
+
+
+def apply_cached_hotel_names_to_result(result: dict[str, Any], provider_name: str) -> dict[str, Any]:
+    data = copy.deepcopy(result)
+    query_city = str((data.get("query") or {}).get("city") or "").strip()
+    payloads: dict[str, dict[str, Any]] = {}
+    for list_name in ("allHotels", "dealHotels", "recommendedHotels"):
+        for hotel in data.get(list_name) or []:
+            if not isinstance(hotel, dict):
+                continue
+            payload = cached_hotel_name_payload(hotel, provider_name)
+            if not payload:
+                continue
+            hotel_id = str(hotel.get("hotelId") or "").strip()
+            key = hotel_merge_key(hotel)
+            if hotel_id:
+                payloads[hotel_id] = payload
+            if key:
+                payloads[key] = payload
+    if not payloads:
+        return data
+    updated = apply_name_payloads_to_result(data, payloads)
+    updated.setdefault("summary", {})["nameCacheHit"] = True
+    updated["summary"]["nameCacheAppliedCount"] = len(payloads)
+    for list_name in ("allHotels", "dealHotels", "recommendedHotels"):
+        updated[list_name] = [
+            normalize_result_hotel_name(hotel, city=query_city)
+            for hotel in list(updated.get(list_name) or [])
+            if isinstance(hotel, dict)
+        ]
+    return updated
 
 
 def hotel_merge_key(hotel: dict[str, Any]) -> str:
@@ -607,12 +860,270 @@ def merge_search_result_with_cached(fresh_result: dict[str, Any], cached_result:
     return data
 
 
+def unique_hotels_needing_name_verification(result: dict[str, Any]) -> list[dict[str, Any]]:
+    hotels: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for list_name in ("allHotels", "dealHotels", "recommendedHotels"):
+        for hotel in result.get(list_name) or []:
+            if not isinstance(hotel, dict) or not hotel_name_needs_verification(hotel):
+                continue
+            key = hotel_merge_key(hotel) or f"object:{id(hotel)}"
+            if key in seen:
+                continue
+            seen.add(key)
+            hotels.append(copy.deepcopy(hotel))
+    return hotels
+
+
+def apply_name_payloads_to_result(
+    result: dict[str, Any],
+    payloads: dict[str, dict[str, Any]],
+    *,
+    finalize_remaining: bool = False,
+) -> dict[str, Any]:
+    data = copy.deepcopy(result)
+    query_city = str((data.get("query") or {}).get("city") or "").strip()
+
+    def update_hotel(hotel: dict[str, Any]) -> dict[str, Any]:
+        key = hotel_merge_key(hotel)
+        hotel_id = str(hotel.get("hotelId") or "").strip()
+        payload = payloads.get(hotel_id) or payloads.get(key)
+        if payload:
+            return apply_verified_hotel_name_payload(hotel, payload, city=query_city)
+        if finalize_remaining and hotel_name_needs_verification(hotel):
+            return finalize_pending_hotel_name(hotel, city=query_city)
+        return normalize_result_hotel_name(hotel, city=query_city)
+
+    for list_name in ("allHotels", "dealHotels", "recommendedHotels"):
+        data[list_name] = [update_hotel(hotel) for hotel in list(data.get(list_name) or []) if isinstance(hotel, dict)]
+
+    sort_by = str((data.get("query") or {}).get("sortBy") or "discount")
+    return apply_sort_to_result(data, sort_by)
+
+
+def verify_result_hotel_names(
+    provider: Any,
+    result: dict[str, Any],
+    selected_date: str,
+    *,
+    progress_callback: Any | None = None,
+    provider_name: str = "tripcom",
+) -> dict[str, Any]:
+    result = apply_cached_hotel_names_to_result(result, provider_name)
+    pending_hotels = unique_hotels_needing_name_verification(result)
+    if not pending_hotels:
+        return apply_name_payloads_to_result(result, {}, finalize_remaining=True)
+
+    verified_payloads: dict[str, dict[str, Any]] = {}
+    pending_by_id = {str(hotel.get("hotelId") or ""): hotel for hotel in pending_hotels if hotel.get("hotelId")}
+    verifier = getattr(provider, "verify_hotel_names", None)
+    if callable(verifier):
+        def handle_progress(progress_info: dict[str, Any]) -> None:
+            hotel_id = str(progress_info.get("hotelId") or "").strip()
+            payload = progress_info.get("payload") if isinstance(progress_info.get("payload"), dict) else None
+            if hotel_id and payload:
+                cache_hotel_name_payload(pending_by_id.get(hotel_id, {}), payload, provider_name)
+                verified_payloads[hotel_id] = payload
+            if progress_callback:
+                progress_callback(
+                    apply_name_payloads_to_result(result, verified_payloads),
+                    {
+                        **progress_info,
+                        "resolvedCount": len(verified_payloads),
+                        "total": len(pending_hotels),
+                    },
+                )
+
+        try:
+            resolved = verifier(pending_hotels, selected_date, progress_callback=handle_progress)
+            if isinstance(resolved, dict):
+                for key, payload in resolved.items():
+                    if isinstance(payload, dict):
+                        cache_hotel_name_payload(pending_by_id.get(str(key), {}), payload, provider_name)
+                        verified_payloads[str(key)] = payload
+        except Exception as exc:
+            if progress_callback:
+                progress_callback(
+                    apply_name_payloads_to_result(result, verified_payloads),
+                    {
+                        "phase": "error",
+                        "error": str(exc),
+                        "resolvedCount": len(verified_payloads),
+                        "total": len(pending_hotels),
+                    },
+                )
+
+    final_result = apply_name_payloads_to_result(result, verified_payloads, finalize_remaining=True)
+    final_summary = final_result.setdefault("summary", {})
+    remaining = unique_hotels_needing_name_verification(final_result)
+    final_summary["nameVerificationComplete"] = True
+    final_summary["nameVerificationTotal"] = len(pending_hotels)
+    final_summary["nameVerificationResolvedCount"] = len(verified_payloads)
+    final_summary["nameVerificationFallbackCount"] = max(len(pending_hotels) - len(verified_payloads), 0)
+    final_summary["nameVerificationRemainingCount"] = len(remaining)
+    return final_result
+
+
+class ProgressiveNameVerifier:
+    def __init__(
+        self,
+        *,
+        provider: Any,
+        selected_date: str,
+        job_id: str,
+        cache_key_value: str,
+        provider_name: str,
+        sort_by: str,
+    ) -> None:
+        self.provider = provider
+        self.selected_date = selected_date
+        self.job_id = job_id
+        self.cache_key_value = cache_key_value
+        self.provider_name = provider_name
+        self.sort_by = sort_by
+        self._lock = threading.Lock()
+        self._payloads: dict[str, dict[str, Any]] = {}
+        self._queue: list[dict[str, Any]] = []
+        self._seen_keys: set[str] = set()
+        self._attempted_keys: set[str] = set()
+        self._thread: threading.Thread | None = None
+        self._verifier = getattr(provider, "verify_hotel_names", None)
+
+    def enabled(self) -> bool:
+        return callable(self._verifier)
+
+    def payloads(self) -> dict[str, dict[str, Any]]:
+        with self._lock:
+            return copy.deepcopy(self._payloads)
+
+    def total_seen(self) -> int:
+        with self._lock:
+            return len(self._seen_keys)
+
+    def resolved_count(self) -> int:
+        with self._lock:
+            return len(self._payloads)
+
+    def apply_to_result(self, result: dict[str, Any], *, finalize_remaining: bool = False) -> dict[str, Any]:
+        result = apply_cached_hotel_names_to_result(result, self.provider_name)
+        payloads = self.payloads()
+        if not payloads and not finalize_remaining:
+            return result
+        return apply_name_payloads_to_result(result, payloads, finalize_remaining=finalize_remaining)
+
+    def enqueue_from_result(self, result: dict[str, Any]) -> None:
+        if not self.enabled():
+            return
+        result = apply_cached_hotel_names_to_result(result, self.provider_name)
+        pending_hotels = unique_hotels_needing_name_verification(result)
+        if not pending_hotels:
+            return
+        should_start = False
+        with self._lock:
+            for hotel in pending_hotels:
+                hotel_id = str(hotel.get("hotelId") or "").strip()
+                if not hotel_id:
+                    continue
+                key = hotel_merge_key(hotel)
+                if not key or key in self._seen_keys:
+                    continue
+                self._seen_keys.add(key)
+                self._queue.append(copy.deepcopy(hotel))
+                should_start = True
+            if should_start and (self._thread is None or not self._thread.is_alive()):
+                self._thread = threading.Thread(
+                    target=self._worker,
+                    name=f"hotel-name-verifier-{self.job_id}",
+                    daemon=True,
+                )
+                self._thread.start()
+        if should_start:
+            self.publish_current_partial(phase="queued")
+
+    def wait_until_idle(self) -> None:
+        while True:
+            with self._lock:
+                thread = self._thread
+            if thread is None:
+                return
+            thread.join(timeout=0.2)
+
+    def publish_current_partial(self, *, phase: str = "progress") -> None:
+        payloads = self.payloads()
+        with self._lock:
+            total = len(self._seen_keys)
+            completed = len(self._attempted_keys)
+            resolved = len(self._payloads)
+            active = bool(self._queue) or (self._thread is not None and self._thread.is_alive())
+        with SEARCH_JOB_LOCK:
+            job = SEARCH_JOBS.get(self.job_id)
+            if not job:
+                return
+            partial_result = copy.deepcopy(job.get("partialResult"))
+            progress = copy.deepcopy(job.get("progress"))
+        if not isinstance(partial_result, dict):
+            return
+        updated = apply_name_payloads_to_result(partial_result, payloads)
+        summary = updated.setdefault("summary", {})
+        summary["nameVerificationActive"] = active
+        summary["nameVerificationTotal"] = total
+        summary["nameVerificationCompletedCount"] = completed
+        summary["nameVerificationResolvedCount"] = resolved
+        summary["nameVerificationPhase"] = phase
+        if progress:
+            summary["progress"] = progress
+            summary["jobStatus"] = progress.get("stage") or summary.get("jobStatus") or "pricing"
+        update_search_job(self.job_id, partialResult=updated)
+        if self.cache_key_value and cacheable_search_result(updated):
+            remember_search_result(self.cache_key_value, self.provider_name, updated)
+
+    def _worker(self) -> None:
+        while True:
+            with self._lock:
+                if not self._queue:
+                    self._thread = None
+                    return
+                hotel = self._queue.pop(0)
+            hotel_key = hotel_merge_key(hotel)
+            self.publish_current_partial(phase="start")
+
+            def handle_progress(progress_info: dict[str, Any]) -> None:
+                hotel_id = str(progress_info.get("hotelId") or "").strip()
+                payload = progress_info.get("payload") if isinstance(progress_info.get("payload"), dict) else None
+                if hotel_id and payload:
+                    cache_hotel_name_payload(hotel, payload, self.provider_name)
+                    with self._lock:
+                        self._payloads[hotel_id] = payload
+                self.publish_current_partial(phase=str(progress_info.get("phase") or "progress"))
+
+            try:
+                kwargs: dict[str, Any] = {"progress_callback": handle_progress}
+                signature = inspect.signature(self._verifier) if callable(self._verifier) else None
+                if signature and "lightweight_only" in signature.parameters:
+                    kwargs["lightweight_only"] = True
+                resolved = self._verifier([hotel], self.selected_date, **kwargs) if callable(self._verifier) else {}
+                if isinstance(resolved, dict):
+                    with self._lock:
+                        for key, payload in resolved.items():
+                            if isinstance(payload, dict):
+                                cache_hotel_name_payload(hotel, payload, self.provider_name)
+                                self._payloads[str(key)] = payload
+            except Exception:
+                pass
+            finally:
+                with self._lock:
+                    if hotel_key:
+                        self._attempted_keys.add(hotel_key)
+                self.publish_current_partial(phase="complete")
+
+
 def remember_search_result(key: str, provider_name: str, result: dict[str, Any]) -> None:
     ttl_seconds = cache_ttl_seconds(provider_name)
     if ttl_seconds <= 0:
         return
     if not cacheable_search_result(result):
         return
+    remember_result_hotel_names(result, provider_name)
     now = time.time()
     expires_at = now + ttl_seconds
     if len(SEARCH_CACHE) >= MAX_SEARCH_CACHE_ITEMS:
@@ -783,12 +1294,21 @@ def start_background_search_job(
         try:
             params = search_parameters(effective_payload, provider_name)
             provider = local_provider() if provider_name == "local" else provider_from_name(APP_DIR, provider_name)
+            name_verifier = ProgressiveNameVerifier(
+                provider=provider,
+                selected_date=params["selected_date"],
+                job_id=job_id,
+                cache_key_value=key,
+                provider_name=provider_name,
+                sort_by=params["sort_by"],
+            )
 
             def publish_partial_result(partial_result: dict[str, Any], *, cache_source: str, stage: str, message: str) -> None:
                 with SEARCH_JOB_LOCK:
                     previous_partial = copy.deepcopy((SEARCH_JOBS.get(job_id) or {}).get("partialResult"))
                 partial_result = merge_search_result_with_cached(partial_result, previous_partial)
                 partial_result = merge_search_result_with_cached(partial_result, base_cached_result)
+                partial_result = name_verifier.apply_to_result(partial_result)
                 partial_summary = partial_result.setdefault("summary", {})
                 partial_summary["cacheHit"] = False
                 partial_summary["cacheSource"] = cache_source
@@ -800,6 +1320,7 @@ def start_background_search_job(
                 update_search_job(job_id, partialResult=partial_result, progress=progress)
                 if cacheable_search_result(partial_result):
                     remember_search_result(key, provider_name, partial_result)
+                name_verifier.enqueue_from_result(partial_result)
 
             def publish_progress_only(stage: str, message: str, *, price_progress: dict[str, Any] | None = None) -> None:
                 progress = job_progress(stage, message, SEARCH_JOBS[job_id]["startedAt"])
@@ -908,6 +1429,84 @@ def start_background_search_job(
                 )
                 result = search_deals(provider=provider, **params)
             result = merge_search_result_with_cached(result, base_cached_result)
+            result = name_verifier.apply_to_result(result)
+            name_verifier.enqueue_from_result(result)
+            pending_name_count = len(unique_hotels_needing_name_verification(result))
+
+            if pending_name_count or name_verifier.total_seen():
+                def publish_name_progress(partial_result: dict[str, Any], progress_info: dict[str, Any]) -> None:
+                    total = int(progress_info.get("total") or pending_name_count)
+                    completed = int(progress_info.get("completed") or progress_info.get("completedCount") or 0)
+                    resolved = name_verifier.resolved_count() + int(progress_info.get("resolvedCount") or 0)
+                    total = max(total, resolved, name_verifier.total_seen())
+                    completed = min(total, completed + name_verifier.resolved_count())
+                    phase = str(progress_info.get("phase") or "")
+                    if phase == "error":
+                        message = f"完整比价已完成，中文名核验遇到阻塞，已先保留 {resolved}/{total} 个已确认名称，其余会用本地中文名兜底。"
+                    elif phase == "complete":
+                        message = f"完整比价已完成，正在核验酒店中文名：{completed}/{total}，已更新 {resolved} 家。"
+                    else:
+                        message = f"完整比价已完成，正在继续核验酒店中文名：{completed}/{total}，已更新 {resolved} 家。"
+                    progress = job_progress("name-verification", message, SEARCH_JOBS[job_id]["startedAt"])
+                    partial_result = apply_sort_to_result(partial_result, params["sort_by"])
+                    partial_summary = partial_result.setdefault("summary", {})
+                    partial_summary["cacheHit"] = False
+                    partial_summary["cacheSource"] = "live-name-verification"
+                    partial_summary["partial"] = True
+                    partial_summary["jobId"] = job_id
+                    partial_summary["jobStatus"] = "name-verification"
+                    partial_summary["priceCompareComplete"] = True
+                    partial_summary["nameVerificationTotal"] = total
+                    partial_summary["nameVerificationResolvedCount"] = resolved
+                    partial_summary["nameVerificationActive"] = True
+                    partial_summary["progress"] = progress
+                    update_search_job(job_id, partialResult=partial_result, progress=progress)
+                    if cacheable_search_result(partial_result):
+                        remember_search_result(key, provider_name, partial_result)
+
+                initial_name_progress = job_progress(
+                    "name-verification",
+                    f"完整比价已完成，正在收尾核验酒店中文名；前面已并行更新 {name_verifier.resolved_count()} 家。",
+                    SEARCH_JOBS[job_id]["startedAt"],
+                )
+                name_partial = apply_sort_to_result(result, params["sort_by"])
+                name_partial.setdefault("summary", {})["partial"] = True
+                name_partial["summary"]["jobStatus"] = "name-verification"
+                name_partial["summary"]["priceCompareComplete"] = True
+                name_partial["summary"]["nameVerificationTotal"] = max(name_verifier.total_seen(), pending_name_count)
+                name_partial["summary"]["nameVerificationResolvedCount"] = name_verifier.resolved_count()
+                name_partial["summary"]["nameVerificationActive"] = True
+                name_partial["summary"]["progress"] = initial_name_progress
+                update_search_job(job_id, partialResult=name_partial, progress=initial_name_progress)
+                name_verifier.wait_until_idle()
+                result = name_verifier.apply_to_result(result)
+                if unique_hotels_needing_name_verification(result):
+                    result = verify_result_hotel_names(
+                        provider,
+                        result,
+                        params["selected_date"],
+                        progress_callback=publish_name_progress,
+                        provider_name=provider_name,
+                    )
+                    final_name_summary = result.setdefault("summary", {})
+                    full_total = int(final_name_summary.get("nameVerificationTotal") or 0)
+                    full_resolved = int(final_name_summary.get("nameVerificationResolvedCount") or 0)
+                    combined_total = max(name_verifier.total_seen(), full_total)
+                    combined_resolved = min(combined_total, name_verifier.resolved_count() + full_resolved)
+                    final_name_summary["nameVerificationTotal"] = combined_total
+                    final_name_summary["nameVerificationResolvedCount"] = combined_resolved
+                    final_name_summary["nameVerificationFallbackCount"] = max(combined_total - combined_resolved, 0)
+                    final_name_summary["nameVerificationRemainingCount"] = len(unique_hotels_needing_name_verification(result))
+                else:
+                    result = apply_name_payloads_to_result(result, name_verifier.payloads(), finalize_remaining=True)
+                    final_name_summary = result.setdefault("summary", {})
+                    final_name_summary["nameVerificationComplete"] = True
+                    final_name_summary["nameVerificationTotal"] = name_verifier.total_seen()
+                    final_name_summary["nameVerificationResolvedCount"] = name_verifier.resolved_count()
+                    final_name_summary["nameVerificationFallbackCount"] = 0
+                    final_name_summary["nameVerificationRemainingCount"] = 0
+                result.setdefault("summary", {})["nameVerificationActive"] = False
+
             result.setdefault("summary", {})["cacheHit"] = False
             result["summary"]["cacheSource"] = "live-complete"
             result["summary"]["elapsedMs"] = round((time.time() - SEARCH_JOBS[job_id]["startedAt"]) * 1000, 1)
@@ -1069,7 +1668,7 @@ def search_job_payload(job_id: str, job: dict[str, Any], sort_by: str) -> tuple[
         result = apply_sort_to_result(partial_result, sort_by)
         result.setdefault("summary", {})["jobId"] = job_id
         progress_stage = str((progress or job.get("progress") or {}).get("stage") or "")
-        result["summary"]["jobStatus"] = "waiting-retry" if progress_stage == "waiting-retry" else "pricing"
+        result["summary"]["jobStatus"] = progress_stage if progress_stage in {"waiting-retry", "name-verification"} else "pricing"
         result["summary"]["partial"] = True
         result["summary"]["progress"] = progress or job.get("progress")
         payload["result"] = result

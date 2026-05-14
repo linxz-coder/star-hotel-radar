@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
+from urllib.parse import parse_qs, urlparse
 
 from providers import ProviderError, TripComProvider
 
@@ -18,6 +20,89 @@ def target_hotel() -> dict:
         "searchType": "H",
         "searchValue": "31~71649086*31*71649086*1",
     }
+
+
+def test_name_verification_uses_ctrip_chinese_page(monkeypatch):
+    provider = TripComProvider()
+    provider._last_target = target_hotel()
+
+    monkeypatch.setattr(provider, "_fetch_detail_page_name_payload", lambda hotel, selected_date: None)
+    monkeypatch.setattr(
+        provider,
+        "_http_text",
+        lambda url, timeout=8: "<html><head><title>深圳国际会展中心皇冠假日酒店预订价格查询-携程酒店</title></head></html>",
+    )
+
+    resolved = provider.verify_hotel_names(
+        [
+            {
+                "hotelId": "99999999",
+                "hotelName": "深圳星级酒店（中文名正在核验中...）",
+                "hotelOriginalName": "Unresolved Original Name",
+                "city": "深圳",
+            }
+        ],
+        "2026-06-01",
+    )
+
+    assert resolved["99999999"]["hotelName"] == "深圳国际会展中心皇冠假日酒店"
+    assert resolved["99999999"]["hotelNameSource"] == "携程中文页"
+
+
+def test_name_verification_uses_elong_as_optional_source(monkeypatch):
+    provider = TripComProvider()
+    provider._last_target = target_hotel()
+
+    monkeypatch.setenv("HOTEL_DEAL_ELONG_USER", "demo-user")
+    monkeypatch.setenv("HOTEL_DEAL_ELONG_APP_KEY", "demo-app-key")
+    monkeypatch.setenv("HOTEL_DEAL_ELONG_SECRET_KEY", "demo-secret")
+    monkeypatch.setenv("HOTEL_DEAL_ELONG_REGION_ID_MAP", json.dumps({"深圳": "1314"}, ensure_ascii=False))
+    monkeypatch.setattr(provider, "_fetch_detail_page_name_payload", lambda hotel, selected_date: None)
+    monkeypatch.setattr(provider, "_fetch_ctrip_name_payload", lambda hotel, selected_date: None)
+    monkeypatch.setattr(provider, "_fetch_map_poi_name_payload", lambda hotel: (_ for _ in ()).throw(AssertionError("map source should not run")))
+    monkeypatch.setattr(provider, "_fetch_search_engine_name_payload", lambda hotel: (_ for _ in ()).throw(AssertionError("search source should not run")))
+
+    requested_urls: list[str] = []
+
+    def fake_http_json(url, timeout=8):
+        requested_urls.append(url)
+        parsed = urlparse(url)
+        params = parse_qs(parsed.query)
+        assert params["method"] == ["ihotel.list"]
+        assert json.loads(params["data"][0])["regionId"] == 1314
+        return {
+            "Code": "0",
+            "Result": {
+                "Hotels": [
+                        {
+                            "HotelId": "elong-99999999",
+                            "HotelNameCn": "深圳国际会展中心测试酒店",
+                            "HotelNameEn": "Unresolved Hotel Near WECC",
+                            "GeoInfo": {"Latitude": 22.709, "Longitude": 113.774},
+                        }
+                ]
+            },
+        }
+
+    monkeypatch.setattr(provider, "_http_json", fake_http_json)
+
+    resolved = provider.verify_hotel_names(
+            [
+                {
+                    "hotelId": "99999999",
+                    "hotelName": "深圳星级酒店（中文名正在核验中...）",
+                    "hotelOriginalName": "Unresolved Hotel Near WECC",
+                    "city": "深圳",
+                    "latitude": 22.709,
+                "longitude": 113.774,
+            }
+        ],
+        "2026-06-01",
+    )
+
+    assert requested_urls
+    assert resolved["99999999"]["hotelName"] == "深圳国际会展中心测试酒店"
+    assert resolved["99999999"]["hotelNameSource"] == "艺龙中文酒店列表"
 
 
 def test_hotel_target_uses_city_fallback_when_no_area_target(monkeypatch):

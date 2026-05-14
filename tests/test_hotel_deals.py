@@ -106,6 +106,8 @@ def test_calculate_deal_score_uses_single_compare_day_threshold():
 def test_detect_hotel_brand():
     assert detectHotelBrand("广州天河希尔顿酒店")["brand"] == "Hilton"
     assert detectHotelBrand("上海浦东丽思卡尔顿酒店")["brand"] == "Marriott"
+    assert detectHotelBrand("广州W酒店")["brand"] == "Marriott"
+    assert detectHotelBrand("W Guangzhou")["brand"] == "Marriott"
     assert detectHotelBrand("广州富力君悦大酒店")["brand"] == "Hyatt"
     assert detectHotelBrand("广州花园酒店") is None
 
@@ -126,6 +128,11 @@ def test_detect_hotel_chain_brand_keeps_non_luxury_chains_out_of_recommended_bra
     huazhu = hotel_brand_payload({"hotelName": "全季酒店（珠海明珠南路店）"})
     assert huazhu["brandLabel"] == "华住"
     assert huazhu["groupLabel"] == "华住集团"
+
+    intercity = hotel_brand_payload({"hotelName": "广州珠江新城城际酒店"})
+    assert intercity["brandLabel"] == "华住"
+    assert intercity["groupLabel"] == "华住集团"
+    assert intercity["brandTier"] == "chain"
 
 
 def test_filter_by_price_uses_current_price():
@@ -547,7 +554,7 @@ def test_current_price_results_can_stream_raw_candidates_before_name_and_price_f
     assert result["summary"]["priceFilterDeferred"] is True
     assert result["summary"]["sortDeferred"] is True
     unknown = next(hotel for hotel in result["allHotels"] if hotel["hotelId"] == "unknown-en")
-    assert unknown["hotelName"] == "深圳星级酒店（中文名待核验）"
+    assert unknown["hotelName"] == "深圳星级酒店（中文名正在核验中...）"
     assert unknown["hotelOriginalName"] == "Unknown Star Hotel Shenzhen"
     assert unknown["nameProcessing"] is True
 
@@ -641,7 +648,7 @@ def test_search_deals_streams_nearby_candidates_before_name_price_and_sort_are_r
     assert first["summary"]["nameNormalizationDeferred"] is True
     assert first["summary"]["priceFilterDeferred"] is True
     assert first["summary"]["sortDeferred"] is True
-    assert first["allHotels"][0]["hotelName"] == "珠海星级酒店（中文名待核验）"
+    assert first["allHotels"][0]["hotelName"] == "珠海星级酒店（中文名正在核验中...）"
     assert first["allHotels"][0]["hotelOriginalName"] == "Raw English Star Hotel Zhuhai"
     assert first["allHotels"][0]["nameProcessing"] is True
 
@@ -650,7 +657,7 @@ def test_search_deals_streams_nearby_candidates_before_name_price_and_sort_are_r
 
     final_hotels = {hotel["hotelId"]: hotel for hotel in result["allHotels"]}
     assert "raw-first" in final_hotels
-    assert final_hotels["raw-first"]["hotelName"] == "珠海星级酒店（中文名待核验）"
+    assert final_hotels["raw-first"]["hotelName"] == "珠海星级酒店（中文名正在核验中...）"
     assert final_hotels["raw-first"]["hotelOriginalName"] == "Raw English Star Hotel Zhuhai"
     assert final_hotels["raw-first"]["nameProcessing"] is True
     assert result["summary"]["nameNormalizationDeferred"] is True
