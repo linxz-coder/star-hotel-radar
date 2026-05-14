@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>星级酒店捡漏雷达</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="search-band" aria-label="酒店捡漏搜索">
+        <div class="title-row">
+          <div>
+            <div class="eyebrow-title">Hotel Deal Radar</div>
+            <h1>星级酒店捡漏雷达</h1>
+            <p class="caption">高星酒店价格机会、同类型日期比价、连锁品牌优先</p>
+          </div>
+        </div>
+
+        <form class="search-form" id="search-form">
+          <input name="provider" type="hidden" value="tripcom" />
+          <label class="city-field">
+            目标城市
+            <input name="city" value="{{ initial_target.city }}" autocomplete="off" required />
+          </label>
+          <label class="wide-field suggest-field">
+            目标酒店 / 位置
+            <input name="targetHotel" value="{{ initial_target.targetHotel }}" autocomplete="off" required />
+            <input name="targetHint" type="hidden" />
+            <div class="suggestion-box hidden" id="target-suggestions"></div>
+          </label>
+          <label class="date-field">
+            入住日期
+            <input name="selectedDate" type="date" value="{{ default_check_in }}" required />
+          </label>
+          <label class="price-field">
+            最低价
+            <input name="minPrice" inputmode="numeric" placeholder="不限" />
+          </label>
+          <label class="price-field">
+            最高价
+            <input name="maxPrice" inputmode="numeric" placeholder="不限" />
+          </label>
+          <label class="filter-field">
+            星级
+            <select name="minStar">
+              <option value="4" selected>四星级以上</option>
+              <option value="4.5">四星半以上</option>
+              <option value="5">五星级</option>
+            </select>
+          </label>
+          <label class="filter-field">
+            半径
+            <select name="radiusKm">
+              <option value="3" selected>3 公里</option>
+              <option value="2">2 公里</option>
+              <option value="1">1 公里</option>
+              <option value="5">5 公里</option>
+            </select>
+          </label>
+          <label class="filter-field">
+            排序
+            <select name="sortBy">
+              <option value="discount" selected>优惠力度</option>
+              <option value="price">价格</option>
+              <option value="distance">距离</option>
+              <option value="star">星级</option>
+            </select>
+          </label>
+          <label class="cache-field">
+            <span>缓存</span>
+            <span class="cache-toggle">
+              <input name="forceRefresh" type="checkbox" value="1" />
+              <span>重新实时搜索</span>
+            </span>
+          </label>
+          <button class="primary-btn" id="submit-btn" type="submit">开始捡漏</button>
+        </form>
+
+        <div class="hot-row" aria-label="最近热搜">
+          <div class="hot-row-title">
+            <span>最近热搜</span>
+            <small>点击后自动填入城市和酒店/地区</small>
+          </div>
+          <div class="hot-list" id="hot-search-list"></div>
+        </div>
+      </section>
+
+      <section class="status-grid" id="status-grid">
+        <div class="status-tile">
+          <span>候选酒店</span>
+          <strong id="candidate-count">-</strong>
+        </div>
+        <div class="status-tile">
+          <span>捡漏酒店</span>
+          <strong id="deal-count">-</strong>
+        </div>
+        <div class="status-tile">
+          <span>连锁推荐</span>
+          <strong id="brand-count">-</strong>
+        </div>
+        <div class="status-tile compare-tile">
+          <span>对比日期</span>
+          <strong id="compare-dates">-</strong>
+        </div>
+      </section>
+
+      <div class="compare-notice hidden" id="compare-notice"></div>
+      <div class="alert hidden" id="error-box"></div>
+      <div class="loading hidden" id="loading-box">正在查询价格和计算优惠...</div>
+
+      <div class="result-jump-widget" id="result-jump-widget">
+        <button class="result-jump-toggle" id="result-jump-toggle" type="button" aria-expanded="false" aria-controls="result-jump-panel">
+          导航
+        </button>
+        <nav class="result-jump-nav" id="result-jump-panel" aria-label="结果区快速跳转">
+          <a href="#deal-section">适合捡漏酒店 <span id="jump-deal-count">-</span></a>
+          <a href="#candidate-section">附近星级候选酒店 <span id="jump-candidate-count">-</span></a>
+          <a href="#recommend-section">知名高端连锁推荐酒店 <span id="jump-brand-count">-</span></a>
+        </nav>
+      </div>
+
+      <section class="result-section" id="deal-section">
+        <div class="section-head">
+          <div>
+            <h2>适合捡漏的酒店</h2>
+            <p>按便宜金额优先展示</p>
+          </div>
+        </div>
+        <div class="hotel-list" id="deal-list"></div>
+      </section>
+
+      <section class="result-section" id="candidate-section">
+        <div class="section-head">
+          <div>
+            <h2>附近星级候选酒店</h2>
+            <p>四星级以上都会保留展示，已出价和待补价候选会随着深搜逐步刷新</p>
+          </div>
+          <div class="hotel-filter" data-filter="candidate" aria-label="候选酒店筛选">
+            <label class="filter-keyword">
+              <span>筛选</span>
+              <input id="candidate-filter-keyword" type="search" placeholder="酒店名 / 品牌" autocomplete="off" />
+            </label>
+            <label class="filter-price">
+              <span>最低价</span>
+              <input id="candidate-filter-min-price" type="number" inputmode="numeric" min="0" step="1" placeholder="不限" />
+            </label>
+            <label class="filter-price">
+              <span>最高价</span>
+              <input id="candidate-filter-max-price" type="number" inputmode="numeric" min="0" step="1" placeholder="不限" />
+            </label>
+            <button id="candidate-filter-reset" class="ghost-btn" type="button">重置</button>
+            <span class="filter-count" id="candidate-filter-count">等待结果</span>
+          </div>
+        </div>
+        <div class="hotel-list" id="candidate-list"></div>
+      </section>
+
+      <section class="result-section" id="recommend-section">
+        <div class="section-head">
+          <div>
+            <h2>知名高端连锁推荐酒店</h2>
+            <p>希尔顿、万豪、雅高、温德姆、洲际、凯悦、香格里拉、凯宾斯基</p>
+          </div>
+          <div class="hotel-filter" data-filter="recommend" aria-label="高端连锁推荐筛选">
+            <label class="filter-keyword">
+              <span>筛选</span>
+              <input id="recommend-filter-keyword" type="search" placeholder="酒店名 / 品牌" autocomplete="off" />
+            </label>
+            <label class="filter-price">
+              <span>最低价</span>
+              <input id="recommend-filter-min-price" type="number" inputmode="numeric" min="0" step="1" placeholder="不限" />
+            </label>
+            <label class="filter-price">
+              <span>最高价</span>
+              <input id="recommend-filter-max-price" type="number" inputmode="numeric" min="0" step="1" placeholder="不限" />
+            </label>
+            <button id="recommend-filter-reset" class="ghost-btn" type="button">重置</button>
+            <span class="filter-count" id="recommend-filter-count">等待结果</span>
+          </div>
+        </div>
+        <div class="hotel-list" id="recommend-list"></div>
+      </section>
+
+      <footer class="footer">
+        <span>作者联系方式</span>
+        <a href="mailto:lxz@underfitting.com">lxz@underfitting.com</a>
+      </footer>
+    </main>
+
+    <script>
+      window.__INITIAL_COMPARE_DATE__ = "{{ default_check_in }}";
+      window.__HOT_TARGETS__ = {{ hot_targets|tojson }};
+    </script>
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+  </body>
+</html>

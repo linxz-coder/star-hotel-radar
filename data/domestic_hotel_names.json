@@ -1,0 +1,91 @@
+{
+  "description": "人工维护的国内 OTA/酒店集团官网标准中文名覆盖表；只用于把已核验英文名替换成简体中文，不做机器翻译。",
+  "byHotelId": {
+    "71649086": {
+      "name": "深圳国际会展中心希尔顿酒店（前海华发冰雪世界店）",
+      "source": "Trip.com/Ctrip 标准中文名"
+    },
+    "54506880": {
+      "name": "深圳国际会展中心皇冠假日酒店",
+      "source": "Trip.com 繁体转简体"
+    },
+    "70801018": {
+      "name": "深圳国际会展中心希尔顿花园酒店（深圳前海华发冰雪世界店）",
+      "source": "Trip.com 繁体转简体"
+    },
+    "109336017": {
+      "name": "深圳国际会展中心洲际酒店",
+      "source": "Trip.com 繁体转简体"
+    },
+    "7270168": {
+      "name": "上海外滩W酒店",
+      "source": "Trip.com/Ctrip 标准中文名"
+    },
+    "345002": {
+      "name": "广州天河希尔顿酒店",
+      "source": "Trip.com/Ctrip 标准中文名"
+    },
+    "46020259": {
+      "name": "惠州佳兆业雅高铂尔曼酒店",
+      "source": "Trip.com/Ctrip 标准中文名"
+    },
+    "666628": {
+      "name": "东莞康帝国际酒店",
+      "source": "Trip.com/Ctrip 标准中文名"
+    },
+    "49232307": {
+      "name": "格兰云天阅酒店（深圳国际会展中心店）",
+      "source": "Trip.com Local hotel name"
+    },
+    "105001585": {
+      "name": "维展湾酒店（深圳国际会展中心福海西地铁站店）",
+      "source": "Trip.com Local hotel name"
+    }
+  },
+  "byName": {
+    "The Skytel World Exhibition & Convention Center": {
+      "name": "格兰云天阅酒店（深圳国际会展中心店）",
+      "source": "Trip.com Local hotel name"
+    },
+    "Weizhan Bay Hotel (Shenzhen International Convention and Exhibition Center Branch)": {
+      "name": "维展湾酒店（深圳国际会展中心福海西地铁站店）",
+      "source": "Trip.com Local hotel name"
+    },
+    "EZZI Hotel (Shenzhen Bao'an International Exhibition Ice and HuaFa Snow World))": {
+      "name": "怡致酒店（深圳宝安国际会展中心冰雪世界店）",
+      "source": "国内 OTA 标准中文名"
+    },
+    "Hilton Garden Inn Shenzhen Bao'an": {
+      "name": "深圳宝安华盛希尔顿花园酒店",
+      "source": "希尔顿中文官网/国内 OTA 标准中文名"
+    },
+    "Hampton by Hilton Guangzhou Tianhe Sports Center": {
+      "name": "广州天河体育中心希尔顿欢朋酒店",
+      "source": "国内 OTA 标准中文名"
+    },
+    "Paco Hotel Tiyuxilu Metro Guangzhou": {
+      "name": "柏高酒店（广州天河体育西路地铁站店）",
+      "source": "国内 OTA 标准中文名"
+    },
+    "Paco Hotel Tiyuxilu Metro Guangzhou-Free Shuttle Bus during Canton Fair": {
+      "name": "柏高酒店（广州天河体育西路地铁站店）",
+      "source": "国内 OTA 标准中文名"
+    },
+    "Ramada Encore Hotel (Dongguan Dongcheng Wanda Plaza)": {
+      "name": "东莞东城万达广场华美达安可酒店",
+      "source": "国内 OTA 标准中文名"
+    },
+    "The Eton Hotel Shanghai": {
+      "name": "上海裕景大饭店",
+      "source": "国内 OTA 标准中文名"
+    },
+    "Jing'an Shangri-La, Shanghai": {
+      "name": "上海静安香格里拉大酒店",
+      "source": "国内 OTA 标准中文名"
+    },
+    "Sheraton Shanghai Pudong Riverside": {
+      "name": "上海浦东滨江喜来登酒店",
+      "source": "国内 OTA 标准中文名"
+    }
+  }
+}

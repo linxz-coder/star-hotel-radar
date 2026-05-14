@@ -1,0 +1,43 @@
+{
+  "hotels": [
+    {
+      "hotelId": "custom-target",
+      "hotelName": "目标酒店名称",
+      "city": "广州",
+      "brand": "",
+      "group": "",
+      "starRating": 5,
+      "latitude": 23.1439,
+      "longitude": 113.3272,
+      "basePrice": 860,
+      "rating": 4.7,
+      "reviewCount": 3000,
+      "imageUrl": "",
+      "tripUrl": "",
+      "isTarget": true
+    },
+    {
+      "hotelId": "custom-nearby-1",
+      "hotelName": "附近酒店名称",
+      "city": "广州",
+      "brand": "Hilton",
+      "group": "Hilton Worldwide",
+      "starRating": 5,
+      "latitude": 23.1358,
+      "longitude": 113.3263,
+      "basePrice": 820,
+      "dealDays": [1, 10, 20],
+      "dealFactor": 0.78,
+      "priceOverrides": {
+        "2026-06-01": 638,
+        "2026-06-02": 910,
+        "2026-06-08": 870,
+        "2026-06-09": 898
+      },
+      "rating": 4.8,
+      "reviewCount": 5000,
+      "imageUrl": "",
+      "tripUrl": ""
+    }
+  ]
+}
