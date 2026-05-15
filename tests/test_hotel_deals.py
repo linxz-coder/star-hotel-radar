@@ -50,6 +50,8 @@ def test_get_compare_dates_holiday_uses_only_holiday_days():
 
 def test_simplified_hotel_name_does_not_translate_english_names():
     assert simplify_chinese_text("深圳國際會展中心希爾頓花園酒店") == "深圳国际会展中心希尔顿花园酒店"
+    assert simplify_chinese_text("廣州嶺南東方酒店") == "广州岭南东方酒店"
+    assert simplify_chinese_text("廣州文華東方酒店") == "广州文华东方酒店"
     payload = normalized_hotel_name_payload("Hilton Garden Inn Shenzhen World Exhibition", source="Trip.com 简体")
     assert payload["hotelName"] == "Hilton Garden Inn Shenzhen World Exhibition"
     assert payload["hotelNameSimplified"] == ""
@@ -109,7 +111,23 @@ def test_detect_hotel_brand():
     assert detectHotelBrand("广州W酒店")["brand"] == "Marriott"
     assert detectHotelBrand("W Guangzhou")["brand"] == "Marriott"
     assert detectHotelBrand("广州富力君悦大酒店")["brand"] == "Hyatt"
+    assert detectHotelBrand("广州文华东方酒店")["brand"] == "Mandarin Oriental"
+    assert detectHotelBrand("廣州嶺南東方酒店")["brand"] == "Lingnan Oriental"
     assert detectHotelBrand("广州花园酒店") is None
+
+
+def test_lingnan_oriental_and_mandarin_oriental_are_luxury_recommendations():
+    lingnan = hotel_brand_payload({"hotelName": "广州岭南东方酒店"})
+    assert lingnan["brandLabel"] == "岭南东方"
+    assert lingnan["groupLabel"] == "岭南酒店集团"
+    assert lingnan["brandRank"] != 99
+    assert lingnan["brandTier"] == "luxury"
+
+    mandarin = hotel_brand_payload({"hotelName": "Mandarin Oriental Guangzhou"})
+    assert mandarin["brandLabel"] == "文华东方"
+    assert mandarin["groupLabel"] == "文华东方酒店集团"
+    assert mandarin["brandRank"] != 99
+    assert mandarin["brandTier"] == "luxury"
 
 
 def test_detect_hotel_chain_brand_keeps_non_luxury_chains_out_of_recommended_brands():

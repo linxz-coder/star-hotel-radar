@@ -138,6 +138,22 @@ BRAND_DEFINITIONS: list[dict[str, Any]] = [
         "rank": 8,
         "aliases": ("kempinski", "凯宾斯基"),
     },
+    {
+        "brand": "Mandarin Oriental",
+        "brandLabel": "文华东方",
+        "group": "Mandarin Oriental Hotel Group",
+        "groupLabel": "文华东方酒店集团",
+        "rank": 9,
+        "aliases": ("mandarin oriental", "文华东方", "文華東方"),
+    },
+    {
+        "brand": "Lingnan Oriental",
+        "brandLabel": "岭南东方",
+        "group": "Lingnan Hotel Group",
+        "groupLabel": "岭南酒店集团",
+        "rank": 10,
+        "aliases": ("lingnan oriental", "岭南东方", "嶺南東方", "岭南东方酒店", "嶺南東方酒店"),
+    },
 ]
 
 CHAIN_BRAND_DEFINITIONS: list[dict[str, Any]] = [
