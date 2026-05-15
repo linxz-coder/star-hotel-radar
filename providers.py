@@ -237,9 +237,14 @@ class TripComProvider:
         self._candidate_cache: dict[str, dict[str, Any]] = {}
         self._price_cache: dict[str, dict[str, int | None]] = {}
         self._persistent_price_cache: Any | None = None
+        self._persistent_candidate_cache: Any | None = None
         self._bypass_persistent_price_cache = False
+        self._bypass_persistent_candidate_cache = False
         self._persistent_price_cache_ttl_seconds = float(
             os.environ.get("HOTEL_DEAL_HOTEL_PRICE_CACHE_TTL_SECONDS", str(24 * 60 * 60))
+        )
+        self._persistent_candidate_cache_ttl_seconds = float(
+            os.environ.get("HOTEL_DEAL_HOTEL_CANDIDATE_CACHE_TTL_SECONDS", str(30 * 24 * 60 * 60))
         )
 
     def set_persistent_price_cache(
@@ -253,6 +258,137 @@ class TripComProvider:
         self._bypass_persistent_price_cache = bool(bypass)
         if ttl_seconds is not None:
             self._persistent_price_cache_ttl_seconds = float(ttl_seconds)
+
+    def set_persistent_candidate_cache(
+        self,
+        candidate_cache: Any | None,
+        *,
+        bypass: bool = False,
+        ttl_seconds: float | None = None,
+    ) -> None:
+        self._persistent_candidate_cache = candidate_cache
+        self._bypass_persistent_candidate_cache = bool(bypass)
+        if ttl_seconds is not None:
+            self._persistent_candidate_cache_ttl_seconds = float(ttl_seconds)
+
+    def _persistent_candidate_cache_available(self) -> bool:
+        return bool(
+            self._persistent_candidate_cache is not None
+            and not self._bypass_persistent_candidate_cache
+            and self._persistent_candidate_cache_ttl_seconds > 0
+        )
+
+    def _candidate_metadata_target_key(self, target_hotel: dict[str, Any], radius_km: float, min_star: float) -> str:
+        payload = {
+            "cityId": int(target_hotel.get("cityId") or 0),
+            "hotelId": str(target_hotel.get("hotelId") or ""),
+            "searchType": str(target_hotel.get("searchType") or ""),
+            "searchValue": str(target_hotel.get("searchValue") or ""),
+            "lat": round(float(target_hotel.get("latitude") or 0), 5),
+            "lon": round(float(target_hotel.get("longitude") or 0), 5),
+            "name": normalize_name(str(target_hotel.get("hotelName") or "")),
+            "radiusKm": round(float(radius_km), 1),
+            "minStar": round(float(min_star), 1),
+        }
+        return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+    def _candidate_metadata_payload(self, hotel: dict[str, Any]) -> dict[str, Any]:
+        allowed_keys = (
+            "hotelId",
+            "hotelName",
+            "hotelOriginalName",
+            "hotelNameSimplified",
+            "hotelNameSource",
+            "city",
+            "cityId",
+            "brand",
+            "group",
+            "starRating",
+            "latitude",
+            "longitude",
+            "distanceKm",
+            "imageUrl",
+            "rating",
+            "reviewCount",
+            "source",
+        )
+        item = {key: copy_value for key in allowed_keys if (copy_value := hotel.get(key)) not in (None, "")}
+        item["currentPrice"] = None
+        item["priceDate"] = ""
+        item["priceIncludesTax"] = False
+        item["priceSource"] = ""
+        return item
+
+    def _candidate_metadata_for_date(self, hotel: dict[str, Any], selected_date: str) -> dict[str, Any]:
+        item = dict(hotel)
+        item["currentPrice"] = None
+        item["priceDate"] = ""
+        item["priceIncludesTax"] = False
+        item["priceSource"] = ""
+        item.pop("visiblePrice", None)
+        item.pop("visiblePriceDate", None)
+        item.pop("currentPricePreview", None)
+        hotel_id = str(item.get("hotelId") or "")
+        city_id = self._hotel_city_id(item, self._last_target)
+        if hotel_id and city_id:
+            checkin_date = parse_date(selected_date)
+            item["tripUrl"] = self._detail_url(hotel_id, city_id, checkin_date, checkin_date + dt.timedelta(days=1))
+        item.setdefault("source", self.source_name)
+        return item
+
+    def _load_persistent_candidate_hotels(
+        self,
+        target_hotel: dict[str, Any],
+        *,
+        radius_km: float,
+        min_star: float,
+        selected_date: str,
+    ) -> list[dict[str, Any]]:
+        if not self._persistent_candidate_cache_available():
+            return []
+        target_key = self._candidate_metadata_target_key(target_hotel, radius_km, min_star)
+        try:
+            rows = self._persistent_candidate_cache.get(
+                self.source_name,
+                target_key=target_key,
+                radius_km=float(radius_km),
+                min_star=float(min_star),
+                max_age_seconds=float(self._persistent_candidate_cache_ttl_seconds),
+            )
+        except Exception:
+            return []
+        hotels = [self._candidate_metadata_for_date(row, selected_date) for row in rows if isinstance(row, dict)]
+        for hotel in hotels:
+            hotel_id = str(hotel.get("hotelId") or "")
+            if hotel_id:
+                self._candidate_cache[hotel_id] = hotel
+        return hotels
+
+    def _store_persistent_candidate_hotels(
+        self,
+        target_hotel: dict[str, Any],
+        *,
+        radius_km: float,
+        min_star: float,
+        hotels: list[dict[str, Any]],
+    ) -> None:
+        if not self._persistent_candidate_cache_available() or not hotels:
+            return
+        rows = [self._candidate_metadata_payload(hotel) for hotel in hotels if hotel.get("hotelId")]
+        if not rows:
+            return
+        try:
+            self._persistent_candidate_cache.store(
+                self.source_name,
+                target_key=self._candidate_metadata_target_key(target_hotel, radius_km, min_star),
+                target_name=str(target_hotel.get("hotelName") or ""),
+                radius_km=float(radius_km),
+                min_star=float(min_star),
+                hotels=rows,
+                expires_at=time.time() + float(self._persistent_candidate_cache_ttl_seconds),
+            )
+        except Exception:
+            return
 
     def resolve_target_hotel(
         self,
@@ -430,6 +566,23 @@ class TripComProvider:
             search_targets = [target_hotel, *supplemental_targets]
 
         search_targets = self._dedupe_search_targets(search_targets)[:3]
+        cached_hotels = self._load_persistent_candidate_hotels(
+            target_hotel,
+            radius_km=radius_km,
+            min_star=min_star,
+            selected_date=selected_date,
+        )
+        if cached_hotels and progress_callback:
+            cached_hotels.sort(key=lambda item: (float(item.get("distanceKm") or 999), -float(item.get("starRating") or 0)))
+            progress_callback(list(cached_hotels))
+        if (
+            cached_hotels
+            and fast_mode
+            and not self._needs_detail_seed_fallback(cached_hotels, fast_mode=True)
+        ):
+            self._last_search_targets = search_targets[:3]
+            return cached_hotels
+
         hotels, used_search_targets = self._fetch_search_targets_for_date(
             search_targets,
             selected_date,
@@ -439,6 +592,8 @@ class TripComProvider:
             fast_mode=fast_mode,
             progress_callback=progress_callback,
         )
+        if cached_hotels:
+            hotels = self._merge_hotel_lists(cached_hotels, hotels)
 
         filtered = self._filter_nearby_hotels(
             hotels=hotels,
@@ -506,6 +661,12 @@ class TripComProvider:
 
         self._last_search_targets = (used_search_targets or search_targets[:1])[:3]
         filtered.sort(key=lambda item: (float(item.get("distanceKm") or 999), -float(item.get("starRating") or 0)))
+        self._store_persistent_candidate_hotels(
+            target_hotel,
+            radius_km=radius_km,
+            min_star=min_star,
+            hotels=filtered,
+        )
         return filtered
 
     def _needs_detail_seed_fallback(self, filtered: list[dict[str, Any]], *, fast_mode: bool) -> bool:

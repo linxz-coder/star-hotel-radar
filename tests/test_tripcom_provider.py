@@ -734,6 +734,93 @@ def test_parallel_date_price_fetch_uses_batched_dom_list_before_detail(monkeypat
     assert prices["40365204"]["2026-06-08"] == 488
 
 
+def test_get_nearby_hotels_uses_persistent_candidate_cache_in_fast_mode(monkeypatch):
+    provider = TripComProvider()
+    provider._last_target = target_hotel()
+    cached_row = {
+        "hotelId": "40365204",
+        "hotelName": "深圳国际会展中心希尔顿花园酒店",
+        "cityId": 30,
+        "starRating": 4,
+        "latitude": 22.705,
+        "longitude": 113.779,
+        "distanceKm": 0.2,
+    }
+
+    class FakeCandidateCache:
+        def get(self, provider_name, **kwargs):
+            assert provider_name == provider.source_name
+            return [cached_row]
+
+        def store(self, *args, **kwargs):
+            pytest.fail("fast cached candidate response should not rewrite candidate cache")
+
+    provider.set_persistent_candidate_cache(FakeCandidateCache(), ttl_seconds=86400)
+    monkeypatch.setattr(provider, "_needs_detail_seed_fallback", lambda filtered, fast_mode: False)
+    monkeypatch.setattr(
+        provider,
+        "_fetch_hotel_list_for_date",
+        lambda *args, **kwargs: pytest.fail("live candidate fetch should not run when fast candidate cache is sufficient"),
+    )
+
+    hotels = provider.get_nearby_hotels(
+        target_hotel(),
+        radius_km=3,
+        min_star=4,
+        selected_date="2026-06-01",
+        fast_mode=True,
+    )
+
+    assert hotels[0]["hotelId"] == "40365204"
+    assert hotels[0]["currentPrice"] is None
+    assert hotels[0]["tripUrl"].startswith("https://www.trip.com/hotels/detail/")
+
+
+def test_get_nearby_hotels_stores_candidate_metadata(monkeypatch):
+    provider = TripComProvider()
+    provider._last_target = target_hotel()
+    stored: list[dict[str, object]] = []
+
+    class FakeCandidateCache:
+        def get(self, *args, **kwargs):
+            return []
+
+        def store(self, provider_name, **kwargs):
+            stored.append({"provider": provider_name, **kwargs})
+
+    provider.set_persistent_candidate_cache(FakeCandidateCache(), ttl_seconds=86400)
+    monkeypatch.setattr(
+        provider,
+        "_fetch_hotel_list_for_date",
+        lambda *args, **kwargs: [
+            {
+                "hotelId": "40365204",
+                "hotelName": "深圳国际会展中心希尔顿花园酒店",
+                "cityId": 30,
+                "starRating": 4,
+                "latitude": 22.705,
+                "longitude": 113.779,
+                "currentPrice": 356,
+                "priceIncludesTax": True,
+            }
+        ],
+    )
+
+    hotels = provider.get_nearby_hotels(
+        target_hotel(),
+        radius_km=3,
+        min_star=4,
+        selected_date="2026-06-01",
+        fast_mode=False,
+    )
+
+    assert hotels
+    assert stored
+    assert stored[0]["provider"] == provider.source_name
+    assert stored[0]["hotels"][0]["hotelId"] == "40365204"
+    assert stored[0]["hotels"][0]["currentPrice"] is None
+
+
 def test_detail_context_recovers_city_id_from_cached_trip_url():
     provider = TripComProvider()
     provider._last_target = target_hotel()

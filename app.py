@@ -32,7 +32,7 @@ from hotel_deals import (
     sort_recommended_hotels,
 )
 from localization import contains_chinese_text, domestic_hotel_name_key, simplify_chinese_text
-from mysql_cache import MySQLHotelNameCache, MySQLHotelPriceCache, MySQLSearchCache
+from mysql_cache import MySQLHotelCandidateCache, MySQLHotelNameCache, MySQLHotelPriceCache, MySQLSearchCache
 from providers import LocalJsonProvider, ProviderError, TripComProvider, provider_from_name
 
 
@@ -56,11 +56,13 @@ MAX_HOT_SEARCH_RECORDS = 80
 MAX_SEARCH_ACTIVITY_ITEMS = 200
 HOT_SEARCH_TTL_SECONDS = 30 * 24 * 60 * 60
 HOTEL_NAME_CACHE_TTL_SECONDS = int(os.environ.get("HOTEL_DEAL_NAME_CACHE_TTL_SECONDS", str(365 * 24 * 60 * 60)))
-CACHE_LOGIC_VERSION = "search_v42_parallel_date_prices"
+CACHE_LOGIC_VERSION = "search_v43_candidate_metadata_cache"
 MYSQL_SEARCH_CACHE = MySQLSearchCache.from_env()
 MYSQL_HOTEL_NAME_CACHE = MySQLHotelNameCache.from_env()
 MYSQL_HOTEL_PRICE_CACHE = MySQLHotelPriceCache.from_env()
+MYSQL_HOTEL_CANDIDATE_CACHE = MySQLHotelCandidateCache.from_env()
 HOTEL_PRICE_CACHE_TTL_SECONDS = int(os.environ.get("HOTEL_DEAL_HOTEL_PRICE_CACHE_TTL_SECONDS", str(24 * 60 * 60)))
+HOTEL_CANDIDATE_CACHE_TTL_SECONDS = int(os.environ.get("HOTEL_DEAL_HOTEL_CANDIDATE_CACHE_TTL_SECONDS", str(30 * 24 * 60 * 60)))
 HOTEL_NAME_CACHE_LOCK = threading.RLock()
 HOTEL_NAME_MEMORY_CACHE: dict[str, dict[str, Any]] = {"byHotelId": {}, "byNameKey": {}}
 HOTEL_NAME_CACHE_LOADED = False
@@ -1526,13 +1528,19 @@ def search_parameters(payload: dict[str, Any], provider_name: str | None = None)
 
 def configure_provider_runtime_cache(provider: Any, *, force_refresh: bool = False) -> None:
     setter = getattr(provider, "set_persistent_price_cache", None)
-    if not callable(setter):
-        return
-    setter(
-        MYSQL_HOTEL_PRICE_CACHE,
-        bypass=force_refresh,
-        ttl_seconds=HOTEL_PRICE_CACHE_TTL_SECONDS,
-    )
+    if callable(setter):
+        setter(
+            MYSQL_HOTEL_PRICE_CACHE,
+            bypass=force_refresh,
+            ttl_seconds=HOTEL_PRICE_CACHE_TTL_SECONDS,
+        )
+    candidate_setter = getattr(provider, "set_persistent_candidate_cache", None)
+    if callable(candidate_setter):
+        candidate_setter(
+            MYSQL_HOTEL_CANDIDATE_CACHE,
+            bypass=force_refresh,
+            ttl_seconds=HOTEL_CANDIDATE_CACHE_TTL_SECONDS,
+        )
 
 
 def run_search_payload(payload: dict[str, Any], provider_name: str, *, quick: bool = False) -> dict[str, Any]:
@@ -1551,6 +1559,78 @@ def job_progress(stage: str, message: str, started_at: float | None = None) -> d
         "updatedAt": now,
         "elapsedMs": round((now - float(started_at or now)) * 1000, 1),
     }
+
+
+PIPELINE_STAGE_DEFS = [
+    ("target", "匹配目标"),
+    ("candidate", "发现候选"),
+    ("selected-price", "目标日价格"),
+    ("compare-price", "对比日比价"),
+    ("name-verification", "中文名核验"),
+    ("finalize", "生成结果"),
+]
+
+
+def initial_pipeline_stages() -> list[dict[str, Any]]:
+    return [
+        {"key": key, "label": label, "status": "pending", "message": "", "updatedAt": None}
+        for key, label in PIPELINE_STAGE_DEFS
+    ]
+
+
+def pipeline_key_for_progress(stage: str) -> str:
+    stage = str(stage or "")
+    if stage in {"queued", "current-price"}:
+        return "target"
+    if stage in {"first-screen", "deep-current-price"}:
+        return "candidate"
+    if stage in {"partial-deals", "compare-price"}:
+        return "compare-price"
+    if stage == "name-verification":
+        return "name-verification"
+    if stage in {"complete", "complete-with-pending-price"}:
+        return "finalize"
+    return "candidate"
+
+
+def update_pipeline_stages(
+    stages: list[dict[str, Any]] | None,
+    progress_stage: str,
+    message: str,
+    *,
+    final: bool = False,
+) -> list[dict[str, Any]]:
+    stages = copy.deepcopy(stages or initial_pipeline_stages())
+    active_key = pipeline_key_for_progress(progress_stage)
+    order = [key for key, _label in PIPELINE_STAGE_DEFS]
+    try:
+        active_index = order.index(active_key)
+    except ValueError:
+        active_index = 0
+    now = time.time()
+    for index, item in enumerate(stages):
+        key = item.get("key")
+        if key not in order:
+            continue
+        if final or index < active_index:
+            item["status"] = "complete"
+        elif index == active_index:
+            item["status"] = "complete" if final else "running"
+            item["message"] = message
+            item["updatedAt"] = now
+        elif item.get("status") not in {"complete", "running"}:
+            item["status"] = "pending"
+    return stages
+
+
+def set_job_pipeline_stage(job_id: str, progress_stage: str, message: str, *, final: bool = False) -> list[dict[str, Any]]:
+    with SEARCH_JOB_LOCK:
+        job = SEARCH_JOBS.get(job_id)
+        if job is None:
+            return update_pipeline_stages(None, progress_stage, message, final=final)
+        stages = update_pipeline_stages(job.get("pipelineStages"), progress_stage, message, final=final)
+        job["pipelineStages"] = stages
+        return copy.deepcopy(stages)
 
 
 def final_search_progress(result: dict[str, Any], started_at: float | None = None) -> dict[str, Any]:
@@ -1701,6 +1781,7 @@ def queued_search_result(payload: dict[str, Any], provider_name: str, job_id: st
             "cacheSource": "live-progress",
             "elapsedMs": 0,
             "progress": progress,
+            "pipelineStages": update_pipeline_stages(initial_pipeline_stages(), "queued", progress["message"]),
         },
     }
 
@@ -1734,6 +1815,7 @@ def start_background_search_job(
             "payload": copy.deepcopy(payload),
             "effectivePayload": copy.deepcopy(effective_payload),
             "startedAt": started_at,
+            "pipelineStages": update_pipeline_stages(initial_pipeline_stages(), "queued", "搜索任务已启动，正在排队连接 Trip.com。"),
             "progress": job_progress(
                 "queued",
                 "搜索任务已启动，正在排队连接 Trip.com。",
@@ -1770,6 +1852,7 @@ def start_background_search_job(
                 partial_summary["jobStatus"] = "pricing"
                 progress = job_progress(stage, message, SEARCH_JOBS[job_id]["startedAt"])
                 partial_summary["progress"] = progress
+                partial_summary["pipelineStages"] = set_job_pipeline_stage(job_id, stage, message)
                 update_search_job(job_id, partialResult=partial_result, progress=progress)
                 if cacheable_search_result(partial_result):
                     remember_search_result(key, provider_name, partial_result)
@@ -1782,16 +1865,23 @@ def start_background_search_job(
                     if job is None:
                         return
                     job["progress"] = progress
+                    job["pipelineStages"] = update_pipeline_stages(job.get("pipelineStages"), stage, message)
                     partial_result = job.get("partialResult")
                     if isinstance(partial_result, dict):
                         partial_summary = partial_result.setdefault("summary", {})
                         partial_summary["progress"] = progress
+                        partial_summary["pipelineStages"] = copy.deepcopy(job["pipelineStages"])
                         partial_summary["jobStatus"] = "pricing"
                         if price_progress is not None:
                             partial_summary["priceProgress"] = price_progress
 
             update_search_job(
                 job_id,
+                pipelineStages=set_job_pipeline_stage(
+                    job_id,
+                    "current-price",
+                    "正在抓取目标日期附近星级酒店，找到候选后会先展示。",
+                ),
                 progress=job_progress(
                     "current-price",
                     "正在抓取目标日期附近星级酒店，找到候选后会先展示。",
@@ -1923,6 +2013,7 @@ def start_background_search_job(
                     partial_summary["nameVerificationResolvedCount"] = resolved
                     partial_summary["nameVerificationActive"] = True
                     partial_summary["progress"] = progress
+                    partial_summary["pipelineStages"] = set_job_pipeline_stage(job_id, "name-verification", message)
                     update_search_job(job_id, partialResult=partial_result, progress=progress)
                     if cacheable_search_result(partial_result):
                         remember_search_result(key, provider_name, partial_result)
@@ -1940,6 +2031,11 @@ def start_background_search_job(
                 name_partial["summary"]["nameVerificationResolvedCount"] = name_verifier.resolved_count()
                 name_partial["summary"]["nameVerificationActive"] = True
                 name_partial["summary"]["progress"] = initial_name_progress
+                name_partial["summary"]["pipelineStages"] = set_job_pipeline_stage(
+                    job_id,
+                    "name-verification",
+                    initial_name_progress["message"],
+                )
                 update_search_job(job_id, partialResult=name_partial, progress=initial_name_progress)
                 name_verifier.wait_until_idle()
                 result = name_verifier.apply_to_result(result)
@@ -1977,6 +2073,12 @@ def start_background_search_job(
             result["summary"]["jobStatus"] = "complete"
             result["summary"]["jobId"] = job_id
             result["summary"]["progress"] = final_search_progress(result, SEARCH_JOBS[job_id]["startedAt"])
+            result["summary"]["pipelineStages"] = set_job_pipeline_stage(
+                job_id,
+                result["summary"]["progress"]["stage"],
+                result["summary"]["progress"]["message"],
+                final=True,
+            )
             if int(result["summary"].get("unpricedCandidateCount") or 0) > 0:
                 result["summary"]["pricePendingComplete"] = True
                 result["summary"]["priceProgress"] = {
@@ -1996,6 +2098,7 @@ def start_background_search_job(
                         "finishedAt": time.time(),
                         "elapsedMs": result["summary"]["elapsedMs"],
                         "progress": result["summary"]["progress"],
+                        "pipelineStages": result["summary"]["pipelineStages"],
                     }
                 )
         except Exception as exc:  # pragma: no cover - exercised through integration
@@ -2082,6 +2185,8 @@ def clear_search_cache(provider: str | None = None) -> None:
         MYSQL_SEARCH_CACHE.clear(provider_name)
     if MYSQL_HOTEL_PRICE_CACHE is not None:
         MYSQL_HOTEL_PRICE_CACHE.clear(provider_name)
+    if MYSQL_HOTEL_CANDIDATE_CACHE is not None:
+        MYSQL_HOTEL_CANDIDATE_CACHE.clear(provider_name)
     try:
         paths = list(SEARCH_CACHE_DIR.glob("*.json"))
     except OSError:
@@ -2274,6 +2379,7 @@ def admin_job_item(job_id: str, job: dict[str, Any]) -> dict[str, Any]:
         "query": compact_search_query(job.get("effectivePayload") or job.get("payload"), result),
         "summary": summary,
         "progress": progress,
+        "pipelineStages": copy.deepcopy(job.get("pipelineStages") or result_summary.get("pipelineStages") or []),
         "progressPercent": progress_percent,
         "taskLabel": admin_task_label(status, summary, progress),
         "startedAt": started_at or None,
@@ -2423,9 +2529,12 @@ def admin_status_payload() -> dict[str, Any]:
         and bool(getattr(MYSQL_HOTEL_NAME_CACHE, "enabled", False)),
         "hotelPriceCacheEnabled": MYSQL_HOTEL_PRICE_CACHE is not None
         and bool(getattr(MYSQL_HOTEL_PRICE_CACHE, "enabled", False)),
+        "hotelCandidateCacheEnabled": MYSQL_HOTEL_CANDIDATE_CACHE is not None
+        and bool(getattr(MYSQL_HOTEL_CANDIDATE_CACHE, "enabled", False)),
         "searchCacheLastError": getattr(MYSQL_SEARCH_CACHE, "last_error", "") if MYSQL_SEARCH_CACHE else "",
         "hotelNameCacheLastError": getattr(MYSQL_HOTEL_NAME_CACHE, "last_error", "") if MYSQL_HOTEL_NAME_CACHE else "",
         "hotelPriceCacheLastError": getattr(MYSQL_HOTEL_PRICE_CACHE, "last_error", "") if MYSQL_HOTEL_PRICE_CACHE else "",
+        "hotelCandidateCacheLastError": getattr(MYSQL_HOTEL_CANDIDATE_CACHE, "last_error", "") if MYSQL_HOTEL_CANDIDATE_CACHE else "",
     }
     return {
         "generatedAt": timestamp_iso(),

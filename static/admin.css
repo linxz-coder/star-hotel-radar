@@ -324,6 +324,37 @@ h1 {
   line-height: 1.5;
 }
 
+.pipeline-line {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.pipeline-step {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  border: 1px solid #dce5ef;
+  border-radius: 7px;
+  background: #fff;
+  color: #64748b;
+  padding: 0 7px;
+  font-size: 11px;
+  font-weight: 780;
+}
+
+.pipeline-step--running {
+  border-color: #9ec5ff;
+  background: #eef6ff;
+  color: var(--blue);
+}
+
+.pipeline-step--complete {
+  border-color: #b7e1d7;
+  background: #edfdf8;
+  color: #0f766e;
+}
+
 .job-meta,
 .summary-line {
   display: flex;

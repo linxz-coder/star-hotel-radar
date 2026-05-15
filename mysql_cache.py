@@ -599,3 +599,180 @@ class MySQLHotelPriceCache(MySQLSearchCache):
                     """
                 )
         self._schema_ready = True
+
+
+@dataclass
+class MySQLHotelCandidateCache(MySQLSearchCache):
+    table: str = "hotel_candidate_cache"
+
+    @classmethod
+    def from_env(cls) -> "MySQLHotelCandidateCache":
+        enabled_value = os.environ.get("HOTEL_DEAL_MYSQL_ENABLED", "auto").strip().lower()
+        enabled = enabled_value not in {"0", "false", "no", "off", "disabled"}
+        return cls(
+            host=os.environ.get("HOTEL_DEAL_MYSQL_HOST", "127.0.0.1"),
+            port=int(os.environ.get("HOTEL_DEAL_MYSQL_PORT", "3306")),
+            user=os.environ.get("HOTEL_DEAL_MYSQL_USER", "root"),
+            password=os.environ.get("HOTEL_DEAL_MYSQL_PASSWORD", ""),
+            database=os.environ.get("HOTEL_DEAL_MYSQL_DATABASE", "star_hotel_deal_app"),
+            table=os.environ.get("HOTEL_DEAL_MYSQL_CANDIDATE_TABLE", "hotel_candidate_cache"),
+            enabled=enabled,
+            connect_timeout=float(os.environ.get("HOTEL_DEAL_MYSQL_CONNECT_TIMEOUT", "1")),
+            read_timeout=float(os.environ.get("HOTEL_DEAL_MYSQL_READ_TIMEOUT", "2")),
+            write_timeout=float(os.environ.get("HOTEL_DEAL_MYSQL_WRITE_TIMEOUT", "2")),
+            cooldown_seconds=float(os.environ.get("HOTEL_DEAL_MYSQL_ERROR_COOLDOWN_SECONDS", "60")),
+        )
+
+    def get(
+        self,
+        provider: str,
+        *,
+        target_key: str,
+        radius_km: float,
+        min_star: float,
+        max_age_seconds: float,
+    ) -> list[dict[str, Any]]:
+        if not self.available():
+            return []
+        cache_hash = cache_digest(f"{provider}:{target_key}:{float(radius_km):.1f}:{float(min_star):.1f}")
+        now = time.time()
+        min_updated_at = now - float(max_age_seconds)
+        try:
+            self.ensure_schema()
+            with self.connect() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        f"""
+                        SELECT payload_json, updated_at, expires_at
+                        FROM `{self.table}`
+                        WHERE cache_hash = %s
+                          AND provider = %s
+                          AND updated_at >= %s
+                          AND expires_at >= %s
+                        LIMIT 1
+                        """,
+                        (cache_hash, provider, min_updated_at, now),
+                    )
+                    row = cursor.fetchone()
+                    if not row:
+                        return []
+                    cursor.execute(
+                        f"""
+                        UPDATE `{self.table}`
+                        SET hit_count = hit_count + 1, last_hit_at = %s
+                        WHERE cache_hash = %s
+                        """,
+                        (now, cache_hash),
+                    )
+            payload = json.loads(row["payload_json"])
+            rows = payload.get("hotels") if isinstance(payload, dict) else payload
+            return rows if isinstance(rows, list) else []
+        except Exception as exc:  # pragma: no cover - depends on local MySQL
+            self.remember_error(exc)
+            return []
+
+    def store(
+        self,
+        provider: str,
+        *,
+        target_key: str,
+        target_name: str,
+        radius_km: float,
+        min_star: float,
+        hotels: list[dict[str, Any]],
+        expires_at: float,
+    ) -> None:
+        if not self.available() or not hotels:
+            return
+        cache_hash = cache_digest(f"{provider}:{target_key}:{float(radius_km):.1f}:{float(min_star):.1f}")
+        now = time.time()
+        payload = {"hotels": hotels}
+        try:
+            self.ensure_schema()
+            with self.connect() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        f"""
+                        INSERT INTO `{self.table}` (
+                            cache_hash, provider, target_key, target_name,
+                            radius_km, min_star, candidate_count, payload_json,
+                            created_at, updated_at, expires_at, last_hit_at, hit_count
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, 0)
+                        ON DUPLICATE KEY UPDATE
+                            target_name = VALUES(target_name),
+                            radius_km = VALUES(radius_km),
+                            min_star = VALUES(min_star),
+                            candidate_count = VALUES(candidate_count),
+                            payload_json = VALUES(payload_json),
+                            updated_at = VALUES(updated_at),
+                            expires_at = VALUES(expires_at)
+                        """,
+                        (
+                            cache_hash,
+                            provider,
+                            target_key,
+                            target_name,
+                            float(radius_km),
+                            float(min_star),
+                            len(hotels),
+                            json.dumps(payload, ensure_ascii=False),
+                            now,
+                            now,
+                            expires_at,
+                        ),
+                    )
+                    cursor.execute(f"DELETE FROM `{self.table}` WHERE expires_at < %s", (now,))
+        except Exception as exc:  # pragma: no cover - depends on local MySQL
+            self.remember_error(exc)
+
+    def clear(self, provider: str | None = None) -> None:
+        if not self.available():
+            return
+        try:
+            self.ensure_schema()
+            with self.connect() as connection:
+                with connection.cursor() as cursor:
+                    if provider:
+                        cursor.execute(f"DELETE FROM `{self.table}` WHERE provider = %s", (provider,))
+                    else:
+                        cursor.execute(f"TRUNCATE TABLE `{self.table}`")
+        except Exception as exc:  # pragma: no cover - depends on local MySQL
+            self.remember_error(exc)
+
+    def ensure_schema(self) -> None:
+        if self._schema_ready:
+            return
+        with self.connect(use_database=False) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    CREATE DATABASE IF NOT EXISTS `{self.database}`
+                    CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+                    """
+                )
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS `{self.table}` (
+                        cache_hash CHAR(64) NOT NULL PRIMARY KEY,
+                        provider VARCHAR(32) NOT NULL,
+                        target_key CHAR(64) NOT NULL,
+                        target_name VARCHAR(255) NULL,
+                        radius_km DECIMAL(5,1) NOT NULL,
+                        min_star DECIMAL(3,1) NOT NULL,
+                        candidate_count INT NOT NULL DEFAULT 0,
+                        payload_json LONGTEXT NOT NULL,
+                        created_at DOUBLE NOT NULL,
+                        updated_at DOUBLE NOT NULL,
+                        expires_at DOUBLE NOT NULL,
+                        last_hit_at DOUBLE NULL,
+                        hit_count INT NOT NULL DEFAULT 0,
+                        INDEX idx_provider_target (provider, target_key),
+                        INDEX idx_updated_at (updated_at),
+                        INDEX idx_expires_at (expires_at)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                    """
+                )
+        self._schema_ready = True

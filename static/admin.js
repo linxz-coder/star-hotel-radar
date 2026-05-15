@@ -158,6 +158,19 @@ function priceProgressText(summary = {}) {
   return `补价进度：${date}已匹配 ${priced}/${total} 家，待补 ${missing} 家`;
 }
 
+function pipelineHtml(stages = []) {
+  if (!Array.isArray(stages) || !stages.length) return "";
+  return `
+    <div class="pipeline-line">
+      ${stages.map((stage) => `
+        <span class="pipeline-step pipeline-step--${escapeHtml(stage.status || "pending")}">
+          ${escapeHtml(stage.label || stage.key || "")}
+        </span>
+      `).join("")}
+    </div>
+  `;
+}
+
 function jobCard(job) {
   const summary = job.summary || {};
   const progress = job.progress || {};
@@ -173,6 +186,7 @@ function jobCard(job) {
         <span class="badge ${badgeClass(job.status)}">${escapeHtml(job.taskLabel || statusText(job.status))}</span>
       </div>
       ${progressHtml(job.progressPercent)}
+      ${pipelineHtml(job.pipelineStages)}
       <div class="job-message">${escapeHtml(message)}</div>
       <div class="summary-line">${summaryChips(summary)}</div>
       <div class="job-meta">
@@ -270,9 +284,11 @@ function renderCache(data) {
     <div class="cache-line"><span>磁盘搜索缓存</span><strong>${formatNumber(metrics.diskCacheItems)} 条</strong></div>
     <div class="cache-line"><span>MySQL 搜索缓存</span><strong>${cache.searchCacheEnabled ? "已启用" : "未启用"}</strong></div>
     <div class="cache-line"><span>MySQL 中文名缓存</span><strong>${cache.hotelNameCacheEnabled ? "已启用" : "未启用"}</strong></div>
+    <div class="cache-line"><span>MySQL 候选元数据缓存</span><strong>${cache.hotelCandidateCacheEnabled ? "已启用" : "未启用"}</strong></div>
     <div class="cache-line"><span>MySQL 酒店日期价格缓存</span><strong>${cache.hotelPriceCacheEnabled ? "已启用" : "未启用"}</strong></div>
     ${cache.searchCacheLastError ? `<div class="cache-line"><span>搜索缓存错误</span><strong>${escapeHtml(cache.searchCacheLastError)}</strong></div>` : ""}
     ${cache.hotelNameCacheLastError ? `<div class="cache-line"><span>中文名缓存错误</span><strong>${escapeHtml(cache.hotelNameCacheLastError)}</strong></div>` : ""}
+    ${cache.hotelCandidateCacheLastError ? `<div class="cache-line"><span>候选缓存错误</span><strong>${escapeHtml(cache.hotelCandidateCacheLastError)}</strong></div>` : ""}
     ${cache.hotelPriceCacheLastError ? `<div class="cache-line"><span>价格缓存错误</span><strong>${escapeHtml(cache.hotelPriceCacheLastError)}</strong></div>` : ""}
   `;
 }

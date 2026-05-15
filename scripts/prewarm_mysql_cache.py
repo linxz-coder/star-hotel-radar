@@ -13,6 +13,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from app import (  # noqa: E402
+    MYSQL_HOTEL_CANDIDATE_CACHE,
     MYSQL_HOTEL_PRICE_CACHE,
     MYSQL_SEARCH_CACHE,
     cache_key,
@@ -92,6 +93,16 @@ def ensure_price_cache_schema() -> bool:
         return False
 
 
+def ensure_candidate_cache_schema() -> bool:
+    if not MYSQL_HOTEL_CANDIDATE_CACHE or not MYSQL_HOTEL_CANDIDATE_CACHE.available():
+        return False
+    try:
+        MYSQL_HOTEL_CANDIDATE_CACHE.ensure_schema()
+        return True
+    except Exception:
+        return False
+
+
 def prewarm_one(
     target: dict[str, Any],
     selected_date: str,
@@ -154,6 +165,7 @@ def main() -> int:
     targets = current_hot_targets(limit=max(1, args.limit))
     dates = parse_dates(args.dates)
     price_schema_ready = ensure_price_cache_schema()
+    candidate_schema_ready = ensure_candidate_cache_schema()
     output: list[dict[str, Any]] = []
     print(
         json.dumps(
@@ -165,6 +177,8 @@ def main() -> int:
                 "mysqlEnabled": bool(MYSQL_SEARCH_CACHE and MYSQL_SEARCH_CACHE.available()),
                 "hotelPriceCacheEnabled": bool(MYSQL_HOTEL_PRICE_CACHE and MYSQL_HOTEL_PRICE_CACHE.available()),
                 "hotelPriceSchemaReady": price_schema_ready,
+                "hotelCandidateCacheEnabled": bool(MYSQL_HOTEL_CANDIDATE_CACHE and MYSQL_HOTEL_CANDIDATE_CACHE.available()),
+                "hotelCandidateSchemaReady": candidate_schema_ready,
             },
             ensure_ascii=False,
         ),

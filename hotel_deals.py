@@ -1461,6 +1461,33 @@ def search_deals(
                     changed = True
         return changed
 
+    def price_fetch_priority(hotel_id: str) -> tuple[int, int, float, float, float, str]:
+        hotel_id = str(hotel_id)
+        hotel = next((item for item in nearby_hotels if str(item.get("hotelId") or "") == hotel_id), {})
+        selected_known = price_map.get(hotel_id, {}).get(selected_value) not in (None, "")
+        brand_payload = hotel_brand_payload(hotel) if hotel else {}
+        brand_rank = int(brand_payload.get("brandRank") or 99)
+        try:
+            distance = float(hotel.get("distanceKm") or 999)
+        except (TypeError, ValueError):
+            distance = 999.0
+        try:
+            star = float(hotel.get("starRating") or 0)
+        except (TypeError, ValueError):
+            star = 0.0
+        try:
+            current_price = float(price_map.get(hotel_id, {}).get(selected_value) or hotel_price_for_selected_date(hotel, selected_value) or 10**9)
+        except (TypeError, ValueError):
+            current_price = 10**9
+        return (
+            0 if selected_known else 1,
+            brand_rank,
+            distance,
+            -star,
+            current_price,
+            hotel_id,
+        )
+
     def backfill_missing_prices_for_dates(
         date_values: list[str],
         *,
@@ -1489,6 +1516,7 @@ def search_deals(
                     continue
                 price_attempted_keys.add(attempt_key)
                 missing_hotel_ids.append(hotel_id)
+            missing_hotel_ids.sort(key=price_fetch_priority)
             if not missing_hotel_ids:
                 continue
 
@@ -1594,7 +1622,7 @@ def search_deals(
         if compare_date not in fetched_compare_dates
     ]
     if callable(parallel_price_fetcher) and len(parallel_compare_dates) > 1:
-        requested_hotel_ids = list(hotel_ids)
+        requested_hotel_ids = sorted(hotel_ids, key=price_fetch_priority)
 
         def publish_parallel_price_progress(progress_info: dict[str, Any]) -> None:
             date_value = str(progress_info.get("date") or "")
@@ -1693,7 +1721,7 @@ def search_deals(
             if phase in {"list", "dom-list", "detail", "deep", "complete"}:
                 publish_price_progress_candidate_snapshot()
 
-        requested_hotel_ids = list(hotel_ids)
+        requested_hotel_ids = sorted(hotel_ids, key=price_fetch_priority)
         date_prices = getHotelPrices(
             provider,
             requested_hotel_ids,
