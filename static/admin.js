@@ -270,8 +270,10 @@ function renderCache(data) {
     <div class="cache-line"><span>磁盘搜索缓存</span><strong>${formatNumber(metrics.diskCacheItems)} 条</strong></div>
     <div class="cache-line"><span>MySQL 搜索缓存</span><strong>${cache.searchCacheEnabled ? "已启用" : "未启用"}</strong></div>
     <div class="cache-line"><span>MySQL 中文名缓存</span><strong>${cache.hotelNameCacheEnabled ? "已启用" : "未启用"}</strong></div>
+    <div class="cache-line"><span>MySQL 酒店日期价格缓存</span><strong>${cache.hotelPriceCacheEnabled ? "已启用" : "未启用"}</strong></div>
     ${cache.searchCacheLastError ? `<div class="cache-line"><span>搜索缓存错误</span><strong>${escapeHtml(cache.searchCacheLastError)}</strong></div>` : ""}
     ${cache.hotelNameCacheLastError ? `<div class="cache-line"><span>中文名缓存错误</span><strong>${escapeHtml(cache.hotelNameCacheLastError)}</strong></div>` : ""}
+    ${cache.hotelPriceCacheLastError ? `<div class="cache-line"><span>价格缓存错误</span><strong>${escapeHtml(cache.hotelPriceCacheLastError)}</strong></div>` : ""}
   `;
 }
 

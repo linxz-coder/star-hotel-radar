@@ -12,6 +12,7 @@ def disable_mysql_cache(monkeypatch):
     app_module = importlib.import_module("app")
     monkeypatch.setattr(app_module, "MYSQL_SEARCH_CACHE", None)
     monkeypatch.setattr(app_module, "MYSQL_HOTEL_NAME_CACHE", None)
+    monkeypatch.setattr(app_module, "MYSQL_HOTEL_PRICE_CACHE", None)
     with app_module.HOTEL_NAME_CACHE_LOCK:
         app_module.HOTEL_NAME_MEMORY_CACHE = {"byHotelId": {}, "byNameKey": {}}
         app_module.HOTEL_NAME_CACHE_LOADED = False

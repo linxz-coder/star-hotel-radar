@@ -32,7 +32,7 @@ from hotel_deals import (
     sort_recommended_hotels,
 )
 from localization import contains_chinese_text, domestic_hotel_name_key, simplify_chinese_text
-from mysql_cache import MySQLHotelNameCache, MySQLSearchCache
+from mysql_cache import MySQLHotelNameCache, MySQLHotelPriceCache, MySQLSearchCache
 from providers import LocalJsonProvider, ProviderError, TripComProvider, provider_from_name
 
 
@@ -56,9 +56,11 @@ MAX_HOT_SEARCH_RECORDS = 80
 MAX_SEARCH_ACTIVITY_ITEMS = 200
 HOT_SEARCH_TTL_SECONDS = 30 * 24 * 60 * 60
 HOTEL_NAME_CACHE_TTL_SECONDS = int(os.environ.get("HOTEL_DEAL_NAME_CACHE_TTL_SECONDS", str(365 * 24 * 60 * 60)))
-CACHE_LOGIC_VERSION = "search_v40_dom_list_price_backfill"
+CACHE_LOGIC_VERSION = "search_v41_hotel_date_price_cache"
 MYSQL_SEARCH_CACHE = MySQLSearchCache.from_env()
 MYSQL_HOTEL_NAME_CACHE = MySQLHotelNameCache.from_env()
+MYSQL_HOTEL_PRICE_CACHE = MySQLHotelPriceCache.from_env()
+HOTEL_PRICE_CACHE_TTL_SECONDS = int(os.environ.get("HOTEL_DEAL_HOTEL_PRICE_CACHE_TTL_SECONDS", str(24 * 60 * 60)))
 HOTEL_NAME_CACHE_LOCK = threading.RLock()
 HOTEL_NAME_MEMORY_CACHE: dict[str, dict[str, Any]] = {"byHotelId": {}, "byNameKey": {}}
 HOTEL_NAME_CACHE_LOADED = False
@@ -1522,9 +1524,21 @@ def search_parameters(payload: dict[str, Any], provider_name: str | None = None)
     }
 
 
+def configure_provider_runtime_cache(provider: Any, *, force_refresh: bool = False) -> None:
+    setter = getattr(provider, "set_persistent_price_cache", None)
+    if not callable(setter):
+        return
+    setter(
+        MYSQL_HOTEL_PRICE_CACHE,
+        bypass=force_refresh,
+        ttl_seconds=HOTEL_PRICE_CACHE_TTL_SECONDS,
+    )
+
+
 def run_search_payload(payload: dict[str, Any], provider_name: str, *, quick: bool = False) -> dict[str, Any]:
     params = search_parameters(payload, provider_name)
     provider = local_provider() if provider_name == "local" else provider_from_name(APP_DIR, provider_name)
+    configure_provider_runtime_cache(provider, force_refresh=force_refresh_requested(payload))
     search_fn = search_current_prices if quick else search_deals
     return search_fn(provider=provider, **params)
 
@@ -1732,6 +1746,7 @@ def start_background_search_job(
         try:
             params = search_parameters(effective_payload, provider_name)
             provider = local_provider() if provider_name == "local" else provider_from_name(APP_DIR, provider_name)
+            configure_provider_runtime_cache(provider, force_refresh=force_refresh)
             name_verifier = ProgressiveNameVerifier(
                 provider=provider,
                 selected_date=params["selected_date"],
@@ -2062,6 +2077,8 @@ def clear_search_cache(provider: str | None = None) -> None:
     SEARCH_CACHE.clear()
     if MYSQL_SEARCH_CACHE is not None:
         MYSQL_SEARCH_CACHE.clear(provider_name)
+    if MYSQL_HOTEL_PRICE_CACHE is not None:
+        MYSQL_HOTEL_PRICE_CACHE.clear(provider_name)
     try:
         paths = list(SEARCH_CACHE_DIR.glob("*.json"))
     except OSError:
@@ -2401,8 +2418,11 @@ def admin_status_payload() -> dict[str, Any]:
         "searchCacheEnabled": MYSQL_SEARCH_CACHE is not None and bool(getattr(MYSQL_SEARCH_CACHE, "enabled", False)),
         "hotelNameCacheEnabled": MYSQL_HOTEL_NAME_CACHE is not None
         and bool(getattr(MYSQL_HOTEL_NAME_CACHE, "enabled", False)),
+        "hotelPriceCacheEnabled": MYSQL_HOTEL_PRICE_CACHE is not None
+        and bool(getattr(MYSQL_HOTEL_PRICE_CACHE, "enabled", False)),
         "searchCacheLastError": getattr(MYSQL_SEARCH_CACHE, "last_error", "") if MYSQL_SEARCH_CACHE else "",
         "hotelNameCacheLastError": getattr(MYSQL_HOTEL_NAME_CACHE, "last_error", "") if MYSQL_HOTEL_NAME_CACHE else "",
+        "hotelPriceCacheLastError": getattr(MYSQL_HOTEL_PRICE_CACHE, "last_error", "") if MYSQL_HOTEL_PRICE_CACHE else "",
     }
     return {
         "generatedAt": timestamp_iso(),

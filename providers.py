@@ -11,6 +11,7 @@ import random
 import re
 import subprocess
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -235,6 +236,23 @@ class TripComProvider:
         self._last_search_targets: list[dict[str, Any]] = []
         self._candidate_cache: dict[str, dict[str, Any]] = {}
         self._price_cache: dict[str, dict[str, int | None]] = {}
+        self._persistent_price_cache: Any | None = None
+        self._bypass_persistent_price_cache = False
+        self._persistent_price_cache_ttl_seconds = float(
+            os.environ.get("HOTEL_DEAL_HOTEL_PRICE_CACHE_TTL_SECONDS", str(24 * 60 * 60))
+        )
+
+    def set_persistent_price_cache(
+        self,
+        price_cache: Any | None,
+        *,
+        bypass: bool = False,
+        ttl_seconds: float | None = None,
+    ) -> None:
+        self._persistent_price_cache = price_cache
+        self._bypass_persistent_price_cache = bool(bypass)
+        if ttl_seconds is not None:
+            self._persistent_price_cache_ttl_seconds = float(ttl_seconds)
 
     def resolve_target_hotel(
         self,
@@ -745,6 +763,7 @@ class TripComProvider:
         return filtered
 
     def get_cached_hotel_prices(self, hotel_ids: list[str], dates: list[str]) -> dict[str, dict[str, int | None]]:
+        self._hydrate_persistent_price_cache(hotel_ids, dates)
         return {
             str(hotel_id): {
                 date: self._price_cache.get(str(hotel_id), {}).get(date)
@@ -759,7 +778,58 @@ class TripComProvider:
 
     def _store_price_if_available(self, hotel_id: str, date_value: str, price: Any) -> None:
         if price not in (None, ""):
-            self._price_cache.setdefault(str(hotel_id), {})[date_value] = price
+            hotel_id_str = str(hotel_id)
+            self._price_cache.setdefault(hotel_id_str, {})[date_value] = price
+            if self._persistent_price_cache_available(write=True):
+                try:
+                    self._persistent_price_cache.store_price(
+                        self.source_name,
+                        hotel_id=hotel_id_str,
+                        price_date=str(date_value),
+                        current_price=price,
+                        expires_at=time.time() + float(self._persistent_price_cache_ttl_seconds),
+                    )
+                except Exception:
+                    pass
+
+    def _persistent_price_cache_available(self, *, write: bool = False) -> bool:
+        if self._bypass_persistent_price_cache:
+            return False
+        cache = self._persistent_price_cache
+        if cache is None:
+            return False
+        if not write and self._persistent_price_cache_ttl_seconds <= 0:
+            return False
+        return True
+
+    def _hydrate_persistent_price_cache(self, hotel_ids: list[str], dates: list[str]) -> None:
+        if not self._persistent_price_cache_available():
+            return
+        missing_hotel_ids = [
+            str(hotel_id)
+            for hotel_id in hotel_ids
+            if str(hotel_id or "").strip()
+            and any(not self._cached_price_available(str(hotel_id), date_value) for date_value in dates)
+        ]
+        if not missing_hotel_ids:
+            return
+        try:
+            cached_prices = self._persistent_price_cache.get_many(
+                self.source_name,
+                missing_hotel_ids,
+                [str(date_value) for date_value in dates],
+                max_age_seconds=float(self._persistent_price_cache_ttl_seconds),
+            )
+        except Exception:
+            return
+        if not isinstance(cached_prices, dict):
+            return
+        for hotel_id, prices in cached_prices.items():
+            if not isinstance(prices, dict):
+                continue
+            for date_value, price in prices.items():
+                if price not in (None, ""):
+                    self._price_cache.setdefault(str(hotel_id), {})[str(date_value)] = int(price)
 
     def _resolved_name_payload_from_sources(
         self,
@@ -877,6 +947,7 @@ class TripComProvider:
         if not self._last_target:
             raise ProviderError("Trip.com Provider 还没有目标酒店上下文")
 
+        self._hydrate_persistent_price_cache(hotel_ids, dates)
         search_targets = self._last_search_targets or [self._last_target]
         for date_index, date_value in enumerate(dates, start=1):
             if progress_callback:

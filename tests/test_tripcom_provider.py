@@ -561,6 +561,122 @@ def test_get_hotel_prices_uses_dom_list_backfill_before_detail(monkeypatch):
     assert "detail" not in phases
 
 
+def test_get_hotel_prices_uses_persistent_price_cache(monkeypatch):
+    provider = TripComProvider()
+    provider._last_target = target_hotel()
+    provider._last_search_targets = [target_hotel()]
+
+    class FakePriceCache:
+        def get_many(self, provider_name, hotel_ids, dates, max_age_seconds):
+            assert provider_name == provider.source_name
+            assert max_age_seconds == 86400
+            return {"40365204": {"2026-06-02": 356}}
+
+        def store_price(self, *args, **kwargs):
+            pytest.fail("cached price should not be re-stored during read")
+
+    provider.set_persistent_price_cache(FakePriceCache(), ttl_seconds=86400)
+    monkeypatch.setattr(
+        provider,
+        "_fetch_hotel_list_for_date",
+        lambda *args, **kwargs: pytest.fail("live list fetch should not run when persistent price cache hits"),
+    )
+
+    prices = provider.get_hotel_prices(["40365204"], ["2026-06-02"])
+
+    assert prices["40365204"]["2026-06-02"] == 356
+
+
+def test_force_refresh_bypasses_persistent_price_cache(monkeypatch):
+    provider = TripComProvider()
+    provider._last_target = target_hotel()
+    provider._last_search_targets = [target_hotel()]
+    provider._candidate_cache = {
+        "40365204": {
+            "hotelId": "40365204",
+            "hotelName": "深圳国际会展中心希尔顿花园酒店",
+            "starRating": 4,
+            "distanceKm": 2.3,
+            "currentPrice": None,
+        }
+    }
+
+    class FakePriceCache:
+        def get_many(self, *args, **kwargs):
+            pytest.fail("force refresh should bypass persistent price cache reads")
+
+        def store_price(self, *args, **kwargs):
+            pytest.fail("force refresh should bypass persistent price cache writes")
+
+    provider.set_persistent_price_cache(FakePriceCache(), bypass=True, ttl_seconds=86400)
+    monkeypatch.setattr(provider, "_fetch_hotel_list_for_date", lambda *args, **kwargs: [])
+    monkeypatch.setattr(provider, "_fetch_list_dom_prices_for_missing", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        provider,
+        "_fetch_detail_prices_for_missing",
+        lambda date_value, missing_hotel_ids: [
+            {
+                **provider._candidate_cache["40365204"],
+                "currentPrice": 401,
+                "priceDate": date_value,
+                "priceIncludesTax": True,
+                "priceSource": "Trip.com detail room total incl. taxes & fees",
+            }
+        ],
+    )
+
+    prices = provider.get_hotel_prices(["40365204"], ["2026-06-02"])
+
+    assert prices["40365204"]["2026-06-02"] == 401
+
+
+def test_tax_prices_are_stored_to_persistent_price_cache(monkeypatch):
+    provider = TripComProvider()
+    provider._last_target = target_hotel()
+    provider._last_search_targets = [target_hotel()]
+    provider._candidate_cache = {
+        "40365204": {
+            "hotelId": "40365204",
+            "hotelName": "深圳国际会展中心希尔顿花园酒店",
+            "starRating": 4,
+            "distanceKm": 2.3,
+            "currentPrice": None,
+        }
+    }
+    stored: list[dict[str, object]] = []
+
+    class FakePriceCache:
+        def get_many(self, *args, **kwargs):
+            return {}
+
+        def store_price(self, provider_name, **kwargs):
+            stored.append({"provider": provider_name, **kwargs})
+
+    provider.set_persistent_price_cache(FakePriceCache(), ttl_seconds=86400)
+    monkeypatch.setattr(provider, "_fetch_hotel_list_for_date", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        provider,
+        "_fetch_list_dom_prices_for_missing",
+        lambda date_value, missing_hotel_ids: [
+            {
+                **provider._candidate_cache["40365204"],
+                "currentPrice": 356,
+                "priceDate": date_value,
+                "priceIncludesTax": True,
+                "priceSource": "Trip.com card total incl. taxes & fees",
+            }
+        ],
+    )
+
+    provider.get_hotel_prices(["40365204"], ["2026-06-02"])
+
+    assert stored
+    assert stored[0]["provider"] == provider.source_name
+    assert stored[0]["hotel_id"] == "40365204"
+    assert stored[0]["price_date"] == "2026-06-02"
+    assert stored[0]["current_price"] == 356
+
+
 def test_detail_context_recovers_city_id_from_cached_trip_url():
     provider = TripComProvider()
     provider._last_target = target_hotel()

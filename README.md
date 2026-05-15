@@ -12,6 +12,7 @@
 - 支持最低价、最高价、星级、半径、排序筛选
 - 酒店中文名优先使用 Trip.com/携程/国内地图等标准中文名；没有标准名时再用繁体转简体或英文规则兜底
 - 相同搜索条件默认缓存 7 天；切换排序会复用缓存并重排，不重复抓取；超过 7 天会重新查询 Trip.com 实时价格
+- 每家酒店每个日期的已核验含税价会单独写入 MySQL，24 小时内复用；勾选“重新实时搜索”时会绕过该价格缓存
 - Trip.com 搜索默认渐进式返回：先返回任务进度；有缓存先秒出缓存，有候选先展示候选，后台继续刷新实时价格和完整比价
 - 支持对最近热搜城市/酒店做 MySQL 定时预热，热门搜索可直接命中缓存
 - 数据层使用 Provider 接口：页面默认使用 `TripComProvider` 实时查询；本地样例/导入数据接口保留给后续人工导入
@@ -25,6 +26,8 @@
 搜索缓存会优先写入本地 MySQL 的 `hotel_search_cache` 表，同时保留 `.cache/search_cache` 文件缓存作为兜底。缓存 key 包含城市、目标酒店、入住日期、半径、星级、价格区间、数据源和规则版本，不包含排序字段，所以同一批搜索结果切换“优惠/价格/距离/星级”排序不会重新搜索。
 
 酒店中文名另有独立缓存：已核验成功的中文名会按 `Trip.com hotelId` 优先写入 MySQL 的 `hotel_name_cache` 表，同时写入 `.cache/hotel_name_cache.json` 文件缓存。下次同一酒店出现在任何搜索结果里，会先直接套用已确认中文名，不再重复访问携程、艺龙、地图或搜索引擎做中文名核验。
+
+酒店日期价格另有独立缓存：已确认是含税总价的 `hotelId + 入住日期` 会写入 MySQL 的 `hotel_price_cache` 表，默认 24 小时有效。后续搜索同一家酒店同一天价格时，会先使用这张表，避免重复打开列表页或详情页；如果用户勾选“重新实时搜索”，本次搜索会跳过价格缓存并重新抓取 Trip.com。
 
 Trip.com 实时搜索结果默认缓存 7 天。7 天是硬 TTL，超过后会自动丢弃旧缓存并重新抓取；另外有 12 小时软刷新窗口：命中缓存时会先把缓存结果秒返回给用户，如果缓存已经较旧或缓存本身只是 partial 结果，系统会在后台刷新 Trip.com 实时价格并覆盖 MySQL。
 
@@ -40,6 +43,7 @@ PASSWORD=
 DATABASE=star_hotel_deal_app
 TABLE=hotel_search_cache
 NAME_TABLE=hotel_name_cache
+PRICE_TABLE=hotel_price_cache
 ```
 
 可用环境变量覆盖：
@@ -52,6 +56,8 @@ export HOTEL_DEAL_MYSQL_PASSWORD=''
 export HOTEL_DEAL_MYSQL_DATABASE=star_hotel_deal_app
 export HOTEL_DEAL_MYSQL_ENABLED=1
 export HOTEL_DEAL_MYSQL_NAME_TABLE=hotel_name_cache
+export HOTEL_DEAL_MYSQL_PRICE_TABLE=hotel_price_cache
+export HOTEL_DEAL_HOTEL_PRICE_CACHE_TTL_SECONDS=86400
 ```
 
 如果 MySQL 不可用，应用会自动退回文件缓存和实时搜索，不会阻断用户搜索。导入酒店数据后，本地数据源缓存会自动清空。
