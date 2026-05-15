@@ -56,7 +56,7 @@ MAX_HOT_SEARCH_RECORDS = 80
 MAX_SEARCH_ACTIVITY_ITEMS = 200
 HOT_SEARCH_TTL_SECONDS = 30 * 24 * 60 * 60
 HOTEL_NAME_CACHE_TTL_SECONDS = int(os.environ.get("HOTEL_DEAL_NAME_CACHE_TTL_SECONDS", str(365 * 24 * 60 * 60)))
-CACHE_LOGIC_VERSION = "search_v39_dom_visible_price_tax_safe"
+CACHE_LOGIC_VERSION = "search_v40_dom_list_price_backfill"
 MYSQL_SEARCH_CACHE = MySQLSearchCache.from_env()
 MYSQL_HOTEL_NAME_CACHE = MySQLHotelNameCache.from_env()
 HOTEL_NAME_CACHE_LOCK = threading.RLock()
@@ -1844,7 +1844,9 @@ def start_background_search_job(
                     elif phase == "start":
                         message = f"正在补齐对比日期含税价：{date_value}（第 {date_index}/{total} 个日期），当前已匹配 {priced}/{total_hotels} 家。"
                     elif phase == "list":
-                        message = f"{date_value} 列表价已匹配 {priced}/{total_hotels} 家，正在用详情页补齐剩余含税价。"
+                        message = f"{date_value} 静态列表已匹配 {priced}/{total_hotels} 家，正在打开该日期列表页批量补齐含税价。"
+                    elif phase == "dom-list":
+                        message = f"正在从 {date_value} 的 Trip.com 列表页批量读取含税价，当前已匹配 {priced}/{total_hotels} 家。"
                     elif phase == "detail":
                         message = f"正在打开 {date_value} 的酒店详情页补齐含税价，当前已匹配 {priced}/{total_hotels} 家。"
                     elif phase == "deep":

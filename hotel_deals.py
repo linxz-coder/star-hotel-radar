@@ -1499,7 +1499,7 @@ def search_deals(
                 normalized["totalExpectedPriceCount"] = len(hotel_ids) * len(dates_to_backfill)
                 if price_progress_callback:
                     price_progress_callback(normalized)
-                if phase in {"list", "detail", "deep", "complete"}:
+                if phase in {"list", "dom-list", "detail", "deep", "complete"}:
                     publish_price_progress_candidate_snapshot()
 
             try:
@@ -1608,7 +1608,7 @@ def search_deals(
             )
             if price_progress_callback:
                 price_progress_callback(normalized)
-            if phase in {"list", "detail", "deep", "complete"}:
+            if phase in {"list", "dom-list", "detail", "deep", "complete"}:
                 publish_price_progress_candidate_snapshot()
 
         requested_hotel_ids = list(hotel_ids)

@@ -935,6 +935,31 @@ class TripComProvider:
                     phase="list",
                 )
             if still_missing:
+                if self._should_run_list_dom_backfill():
+                    if progress_callback:
+                        self._publish_price_progress(
+                            progress_callback,
+                            hotel_ids=hotel_ids,
+                            dates=dates,
+                            date_value=date_value,
+                            date_index=date_index,
+                            completed_dates=date_index - 1,
+                            phase="dom-list",
+                        )
+                    dom_hotels = self._fetch_list_dom_prices_for_missing(date_value, still_missing)
+                    for hotel in dom_hotels:
+                        hotel_id = str(hotel.get("hotelId") or "")
+                        if not hotel_id:
+                            continue
+                        self._candidate_cache[hotel_id] = hotel
+                        if self._hotel_price_matches_date(hotel, date_value):
+                            self._store_price_if_available(hotel_id, date_value, hotel.get("currentPrice"))
+                    still_missing = [
+                        str(hotel_id)
+                        for hotel_id in hotel_ids
+                        if not self._cached_price_available(str(hotel_id), date_value)
+                    ]
+            if still_missing:
                 if progress_callback:
                     self._publish_price_progress(
                         progress_callback,
@@ -1051,6 +1076,49 @@ class TripComProvider:
             "yes",
             "on",
         }
+
+    def _list_dom_backfill_enabled(self) -> bool:
+        value = str(os.environ.get("HOTEL_DEAL_ENABLE_LIST_DOM_BACKFILL") or "1").strip().lower()
+        return value not in {"0", "false", "no", "off"}
+
+    def _hotel_list_fetcher_overridden(self) -> bool:
+        return "_fetch_hotel_list_for_date" in self.__dict__
+
+    def _should_run_list_dom_backfill(self) -> bool:
+        if not self._list_dom_backfill_enabled():
+            return False
+        if self._hotel_list_fetcher_overridden() and "_fetch_list_dom_prices_for_missing" not in self.__dict__:
+            return False
+        return True
+
+    def _fetch_list_dom_prices_for_missing(self, date_value: str, missing_hotel_ids: list[str]) -> list[dict[str, Any]]:
+        missing = {str(hotel_id) for hotel_id in missing_hotel_ids if str(hotel_id or "").strip()}
+        if not missing:
+            return []
+        fetched: list[dict[str, Any]] = []
+        search_targets = self._last_search_targets or ([self._last_target] if self._last_target else [])
+        for search_target in search_targets[:2]:
+            if not search_target:
+                continue
+            try:
+                target_hotels = self._fetch_hotel_list_for_date(
+                    search_target,
+                    date_value,
+                    deep_mode=True,
+                    price_backfill_mode=True,
+                    wanted_hotel_ids=missing,
+                )
+            except ProviderError:
+                continue
+            fetched = self._merge_hotel_lists(fetched, target_hotels)
+            fetched_ids = {
+                str(hotel.get("hotelId") or "")
+                for hotel in fetched
+                if self._hotel_price_matches_date(hotel, date_value)
+            }
+            if missing.issubset(fetched_ids):
+                break
+        return fetched
 
     def _fetch_detail_prices_for_missing(self, date_value: str, missing_hotel_ids: list[str]) -> list[dict[str, Any]]:
         fetched: list[dict[str, Any]] = []
@@ -2298,9 +2366,12 @@ Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
         fast_mode: bool = False,
         deep_mode: bool = False,
         result_callback: Any | None = None,
+        price_backfill_mode: bool = False,
+        wanted_hotel_ids: set[str] | None = None,
     ) -> list[dict[str, Any]]:
         html_items = self._fetch_hotel_list_from_html(target, check_in, fast_mode=fast_mode)
-        last_published_signature: tuple[tuple[str, str, str], ...] = ()
+        wanted_ids = {str(hotel_id) for hotel_id in (wanted_hotel_ids or set()) if str(hotel_id or "").strip()}
+        last_published_signature: tuple[tuple[str, str, str, str], ...] = ()
 
         def publish_response_items(items: list[dict[str, Any]]) -> None:
             nonlocal last_published_signature
@@ -2324,6 +2395,18 @@ Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
             except Exception:
                 pass
 
+        def wanted_tax_prices_found(items: list[dict[str, Any]]) -> bool:
+            if not wanted_ids:
+                return False
+            found_ids = {
+                str(item.get("hotelId") or "")
+                for item in self._dedupe_hotel_items(items)
+                if str(item.get("hotelId") or "") in wanted_ids
+                and item.get("currentPrice") not in (None, "")
+                and item.get("priceIncludesTax") is not False
+            }
+            return wanted_ids.issubset(found_ids)
+
         if html_items:
             publish_response_items(html_items)
         if html_items and fast_mode and not deep_mode:
@@ -2341,12 +2424,12 @@ Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
         checkout_date = checkin_date + dt.timedelta(days=1)
         url = self._build_list_url(target, checkin_date, checkout_date)
         response_items: list[dict[str, Any]] = list(html_items)
-        goto_timeout_ms = 45000
-        homepage_wait_ms = 800
-        attempt_waits_ms = (3500,) if fast_mode else (3500, 6500)
-        scroll_rounds = 30 if deep_mode else (18 if not fast_mode else 10)
-        min_scroll_rounds = 8 if deep_mode else (5 if not fast_mode else 3)
-        scroll_wait_ms = 1000
+        goto_timeout_ms = 35000 if price_backfill_mode else 45000
+        homepage_wait_ms = 500 if price_backfill_mode else 800
+        attempt_waits_ms = (1800,) if price_backfill_mode else ((3500,) if fast_mode else (3500, 6500))
+        scroll_rounds = 18 if price_backfill_mode else (30 if deep_mode else (18 if not fast_mode else 10))
+        min_scroll_rounds = 5 if price_backfill_mode else (8 if deep_mode else (5 if not fast_mode else 3))
+        scroll_wait_ms = 650 if price_backfill_mode else 1000
 
         def collect_response_items(response: Any) -> None:
             response_url = str(response.url or "")
@@ -2405,6 +2488,8 @@ Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
                         page.goto(url, wait_until=wait_until_state, timeout=goto_timeout_ms)
                         page.wait_for_timeout(initial_wait_ms)
                         publish_response_items(response_items)
+                        if wanted_tax_prices_found(response_items):
+                            break
                         last_count = len(self._dedupe_hotel_items(response_items))
                         stale_rounds = 0
                         for scroll_index in range(scroll_rounds):
@@ -2419,6 +2504,8 @@ Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
                                 last_count = current_count
                                 stale_rounds = 0
                                 publish_response_items(response_items)
+                                if wanted_tax_prices_found(response_items):
+                                    break
                             elif scroll_index >= min_scroll_rounds:
                                 stale_rounds += 1
                             if scroll_index >= min_scroll_rounds and stale_rounds >= 3:

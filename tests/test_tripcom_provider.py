@@ -4,6 +4,8 @@ import datetime as dt
 import json
 from urllib.parse import parse_qs, urlparse
 
+import pytest
+
 from providers import ProviderError, TripComProvider
 
 
@@ -510,6 +512,53 @@ def test_get_hotel_prices_opens_own_detail_when_list_card_has_no_price(monkeypat
 
     assert detail_calls == ["40365204"]
     assert prices["40365204"]["2026-06-02"] == 777
+
+
+def test_get_hotel_prices_uses_dom_list_backfill_before_detail(monkeypatch):
+    provider = TripComProvider()
+    provider._last_target = target_hotel()
+    provider._last_search_targets = [target_hotel()]
+    provider._candidate_cache = {
+        "40365204": {
+            "hotelId": "40365204",
+            "hotelName": "深圳国际会展中心希尔顿花园酒店",
+            "starRating": 4,
+            "distanceKm": 2.3,
+            "currentPrice": None,
+        }
+    }
+    provider._price_cache = {}
+    phases: list[str] = []
+
+    monkeypatch.setattr(provider, "_fetch_hotel_list_for_date", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        provider,
+        "_fetch_list_dom_prices_for_missing",
+        lambda date_value, missing_hotel_ids: [
+            {
+                **provider._candidate_cache["40365204"],
+                "currentPrice": 356,
+                "priceDate": date_value,
+                "priceIncludesTax": True,
+                "priceSource": "Trip.com card total incl. taxes & fees",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        provider,
+        "_fetch_detail_prices_for_missing",
+        lambda date_value, missing_hotel_ids: pytest.fail("detail fallback should not run when DOM list has tax price"),
+    )
+
+    prices = provider.get_hotel_prices(
+        ["40365204"],
+        ["2026-06-02"],
+        progress_callback=lambda event: phases.append(event["phase"]),
+    )
+
+    assert prices["40365204"]["2026-06-02"] == 356
+    assert "dom-list" in phases
+    assert "detail" not in phases
 
 
 def test_detail_context_recovers_city_id_from_cached_trip_url():
