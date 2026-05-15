@@ -416,6 +416,48 @@ select:focus {
   font-weight: 760;
 }
 
+.result-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  min-height: 38px;
+  margin: -4px 0 14px;
+}
+
+.export-pdf-btn {
+  min-height: 34px;
+  border: 1px solid #cbd8e6;
+  border-radius: 8px;
+  background: #fff;
+  color: var(--blue);
+  padding: 0 13px;
+  font-size: 13px;
+  font-weight: 820;
+  box-shadow: 0 7px 18px rgba(31, 45, 68, 0.06);
+}
+
+.export-pdf-btn:hover,
+.export-pdf-btn:focus {
+  border-color: var(--blue);
+  background: #f5f9ff;
+  outline: none;
+}
+
+.export-pdf-btn:disabled {
+  cursor: not-allowed;
+  border-color: #dbe3ed;
+  background: #f8fafc;
+  color: #94a3b8;
+  box-shadow: none;
+}
+
+.export-pdf-hint {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
 .result-jump-widget {
   position: fixed;
   top: 52%;
@@ -1081,6 +1123,22 @@ select:focus {
 
   .compare-tile strong {
     font-size: 13px;
+  }
+
+  .result-actions {
+    display: grid;
+    justify-items: stretch;
+    gap: 7px;
+    margin: 0 0 12px;
+  }
+
+  .export-pdf-btn {
+    width: 100%;
+    min-height: 40px;
+  }
+
+  .export-pdf-hint {
+    text-align: center;
   }
 
   .result-jump-widget {

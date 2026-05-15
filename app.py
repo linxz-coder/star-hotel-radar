@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import copy
 import hashlib
+import html
 import inspect
 import json
 import os
@@ -11,6 +12,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from flask import Flask, Response, jsonify, render_template, request, stream_with_context
 from werkzeug.exceptions import HTTPException
@@ -94,6 +96,248 @@ def parse_bool(value: Any, default: bool = True) -> bool:
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() not in {"0", "false", "no", "off", "disabled"}
+
+
+def export_text(value: Any, default: str = "-") -> str:
+    text = simplify_chinese_text(str(value or "")).strip()
+    return text or default
+
+
+def export_money(value: Any) -> str:
+    if value in (None, ""):
+        return "-"
+    try:
+        return f"¥{int(round(float(value))):,}"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def export_percent(value: Any) -> str:
+    if value in (None, ""):
+        return "-"
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    return f"{number:.1f}".rstrip("0").rstrip(".") + "%"
+
+
+def export_number(value: Any, suffix: str = "", digits: int = 1) -> str:
+    if value in (None, ""):
+        return "-"
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    formatted = f"{number:.{digits}f}".rstrip("0").rstrip(".")
+    return f"{formatted}{suffix}"
+
+
+def export_hotel_name(hotel: dict[str, Any]) -> str:
+    return export_text(
+        hotel.get("hotelName")
+        or hotel.get("hotelNameSimplified")
+        or hotel.get("hotelOriginalName")
+        or "未命名酒店"
+    )
+
+
+def export_hotel_brand(hotel: dict[str, Any]) -> str:
+    return export_text(
+        hotel.get("groupLabel")
+        or hotel.get("brandLabel")
+        or hotel.get("group")
+        or hotel.get("brand")
+        or "独立酒店"
+    )
+
+
+def html_escape(value: Any) -> str:
+    return html.escape(str(value if value is not None else ""), quote=True)
+
+
+def export_price_delta(hotel: dict[str, Any]) -> tuple[str, str]:
+    amount = hotel.get("discountAmount")
+    percent = hotel.get("discountPercent")
+    if amount in (None, ""):
+        return "-", "neutral"
+    try:
+        numeric = float(amount)
+    except (TypeError, ValueError):
+        return "-", "neutral"
+    try:
+        percent_value = abs(float(percent))
+    except (TypeError, ValueError):
+        percent_value = None
+    percent_text = export_percent(percent_value)
+    if numeric > 0:
+        return f"便宜 {export_money(abs(numeric))} / {percent_text}", "positive"
+    if numeric < 0:
+        return f"高出 {export_money(abs(numeric))} / {percent_text}", "negative"
+    return "持平", "neutral"
+
+
+def export_hotel_table(hotels: list[dict[str, Any]], *, title: str, empty_text: str) -> str:
+    rows: list[str] = []
+    for index, hotel in enumerate(hotels, start=1):
+        delta_text, delta_class = export_price_delta(hotel)
+        trip_url = str(hotel.get("tripUrl") or "").strip()
+        trip_link = f'<a href="{html_escape(trip_url)}">Trip.com</a>' if trip_url else "-"
+        rows.append(
+            "<tr>"
+            f"<td class=\"idx\">{index}</td>"
+            f"<td class=\"name\">{html_escape(export_hotel_name(hotel))}</td>"
+            f"<td>{html_escape(export_number(hotel.get('starRating'), '星', 0))}</td>"
+            f"<td>{html_escape(export_hotel_brand(hotel))}</td>"
+            f"<td>{html_escape(export_number(hotel.get('distanceKm'), 'km', 1))}</td>"
+            f"<td>{html_escape(export_money(hotel.get('currentPrice')))}</td>"
+            f"<td>{html_escape(export_money(hotel.get('referencePrice') or hotel.get('averageComparePrice')))}</td>"
+            f"<td class=\"delta {delta_class}\">{html_escape(delta_text)}</td>"
+            f"<td>{html_escape(export_number(hotel.get('rating'), '分', 1))}</td>"
+            f"<td>{html_escape(export_number(hotel.get('reviewCount'), '', 0))}</td>"
+            f"<td>{trip_link}</td>"
+            "</tr>"
+        )
+    body = "\n".join(rows) if rows else f"<tr><td colspan=\"11\" class=\"empty\">{html_escape(empty_text)}</td></tr>"
+    return f"""
+      <section class="pdf-section">
+        <h2>{html_escape(title)} <small>{len(hotels)} 家</small></h2>
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>酒店名称</th>
+              <th>星级</th>
+              <th>品牌/集团</th>
+              <th>距离</th>
+              <th>目标价</th>
+              <th>参考价</th>
+              <th>价格差</th>
+              <th>评分</th>
+              <th>点评</th>
+              <th>链接</th>
+            </tr>
+          </thead>
+          <tbody>{body}</tbody>
+        </table>
+      </section>
+    """
+
+
+def export_pdf_filename(result: dict[str, Any]) -> str:
+    query = result.get("query") if isinstance(result.get("query"), dict) else {}
+    city = re.sub(r"[^\w\u4e00-\u9fff-]+", "-", export_text(query.get("city"), "搜索"))
+    target = re.sub(r"[^\w\u4e00-\u9fff-]+", "-", export_text(query.get("targetHotel"), "酒店"))
+    selected_date = re.sub(r"[^0-9-]+", "", export_text(query.get("selectedDate"), dt.date.today().isoformat()))
+    return f"星级酒店捡漏雷达-{city}-{target}-{selected_date}.pdf"
+
+
+def build_search_result_pdf_html(result: dict[str, Any]) -> str:
+    query = result.get("query") if isinstance(result.get("query"), dict) else {}
+    summary = result.get("summary") if isinstance(result.get("summary"), dict) else {}
+    compare_dates = result.get("compareDates") or []
+    all_hotels = [hotel for hotel in (result.get("allHotels") or []) if isinstance(hotel, dict)]
+    deal_hotels = [hotel for hotel in (result.get("dealHotels") or []) if isinstance(hotel, dict)]
+    recommended_hotels = [hotel for hotel in (result.get("recommendedHotels") or []) if isinstance(hotel, dict)]
+    generated_at = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+    city = export_text(query.get("city"))
+    target = export_text(query.get("targetHotel"))
+    selected_date = export_text(query.get("selectedDate"))
+    provider = export_text(summary.get("source"), "Trip.com 实时价格")
+    holiday_payload = summary.get("holiday") if isinstance(summary.get("holiday"), dict) else {}
+    holiday = export_text(summary.get("holidayName") or holiday_payload.get("name"), "")
+    compare_label = "、".join(export_text(date) for date in compare_dates) or "-"
+    holiday_note = f"<p class=\"notice\">本次为{html_escape(holiday)}公众假期对比。</p>" if holiday else ""
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>星级酒店捡漏雷达搜索记录</title>
+  <style>
+    @page {{ size: A4; margin: 14mm 10mm; }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      color: #162033;
+      font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
+      font-size: 11px;
+      line-height: 1.45;
+    }}
+    h1 {{ margin: 0 0 6px; font-size: 24px; }}
+    h2 {{ margin: 18px 0 8px; font-size: 15px; }}
+    h2 small {{ color: #64748b; font-size: 11px; font-weight: 600; }}
+    .meta {{
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 8px;
+      margin: 12px 0;
+    }}
+    .meta div {{
+      border: 1px solid #d7e0ea;
+      border-radius: 6px;
+      padding: 7px 8px;
+      background: #f8fafc;
+    }}
+    .meta span {{ display: block; color: #64748b; font-size: 10px; }}
+    .meta strong {{ display: block; margin-top: 2px; font-size: 12px; }}
+    .caption, .notice {{ color: #526174; margin: 0; }}
+    .notice {{ color: #9a5a00; }}
+    table {{ width: 100%; border-collapse: collapse; page-break-inside: auto; }}
+    thead {{ display: table-header-group; }}
+    tr {{ page-break-inside: avoid; page-break-after: auto; }}
+    th, td {{ border: 1px solid #d9e2ee; padding: 5px 6px; vertical-align: top; }}
+    th {{ background: #edf3f8; color: #44546a; font-size: 10px; text-align: left; }}
+    td {{ word-break: break-word; }}
+    .idx {{ width: 24px; text-align: center; color: #64748b; }}
+    .name {{ width: 190px; font-weight: 700; }}
+    .delta.positive {{ color: #08704f; font-weight: 700; }}
+    .delta.negative {{ color: #b42318; font-weight: 700; }}
+    .delta.neutral {{ color: #64748b; }}
+    .empty {{ text-align: center; color: #64748b; padding: 14px; }}
+    a {{ color: #1c5fc7; text-decoration: none; }}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>星级酒店捡漏雷达搜索记录</h1>
+    <p class="caption">导出时间：{html_escape(generated_at)}｜数据源：{html_escape(provider)}｜价格为 Trip.com 已返回的含税价/参考价。</p>
+    {holiday_note}
+    <div class="meta">
+      <div><span>目标城市</span><strong>{html_escape(city)}</strong></div>
+      <div><span>目标酒店/位置</span><strong>{html_escape(target)}</strong></div>
+      <div><span>入住日期</span><strong>{html_escape(selected_date)}</strong></div>
+      <div><span>搜索半径</span><strong>{html_escape(export_number(query.get('effectiveRadiusKm') or query.get('radiusKm'), 'km', 0))}</strong></div>
+      <div><span>对比日期</span><strong>{html_escape(compare_label)}</strong></div>
+      <div><span>全部候选</span><strong>{len(all_hotels)} 家</strong></div>
+      <div><span>捡漏酒店</span><strong>{len(deal_hotels)} 家</strong></div>
+      <div><span>连锁推荐</span><strong>{len(recommended_hotels)} 家</strong></div>
+    </div>
+  </header>
+  {export_hotel_table(deal_hotels, title="适合捡漏的酒店", empty_text="本次搜索暂无符合捡漏标准的酒店。")}
+  {export_hotel_table(recommended_hotels, title="知名高端连锁推荐酒店", empty_text="本次搜索暂无知名高端连锁推荐酒店。")}
+  {export_hotel_table(all_hotels, title="全部附近星级候选酒店", empty_text="本次搜索暂无附近星级候选酒店。")}
+</body>
+</html>"""
+
+
+def render_search_result_pdf(result: dict[str, Any]) -> bytes:
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as exc:
+        raise HotelDealError("当前 Python 环境没有安装 Playwright，无法导出 PDF") from exc
+
+    html_text = build_search_result_pdf_html(result)
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        page = browser.new_page(viewport={"width": 1240, "height": 1754})
+        page.set_content(html_text, wait_until="load")
+        pdf_bytes = page.pdf(
+            format="A4",
+            print_background=True,
+            margin={"top": "14mm", "right": "10mm", "bottom": "14mm", "left": "10mm"},
+        )
+        browser.close()
+    return pdf_bytes
 
 
 def default_check_in() -> str:
@@ -1947,6 +2191,41 @@ def search_events(job_id: str):
         event_stream(),
         mimetype="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/api/export/pdf")
+def export_pdf():
+    payload = request.get_json(silent=True) or {}
+    result = payload.get("result") if isinstance(payload.get("result"), dict) else None
+    if result is None and payload.get("jobId"):
+        sort_by = str(payload.get("sortBy") or "discount")
+        snapshot, status_code = search_job_snapshot(str(payload.get("jobId")), sort_by)
+        if status_code != 200 or not isinstance(snapshot.get("result"), dict):
+            return jsonify({"error": snapshot.get("error") or "搜索记录不存在，无法导出 PDF"}), status_code
+        result = snapshot["result"]
+    if result is None and any(key in payload for key in ("allHotels", "dealHotels", "recommendedHotels")):
+        result = payload
+    if not isinstance(result, dict):
+        return jsonify({"error": "没有可导出的搜索记录"}), 400
+    hotel_count = sum(
+        len(result.get(list_name) or [])
+        for list_name in ("allHotels", "dealHotels", "recommendedHotels")
+        if isinstance(result.get(list_name), list)
+    )
+    if hotel_count <= 0:
+        return jsonify({"error": "当前搜索记录还没有酒店结果，暂时无法导出 PDF"}), 400
+    try:
+        pdf_bytes = render_search_result_pdf(result)
+    except HotelDealError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:  # pragma: no cover
+        return jsonify({"error": f"PDF 导出失败：{exc}"}), 500
+    filename = export_pdf_filename(result)
+    return Response(
+        pdf_bytes,
+        mimetype="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"},
     )
 
 

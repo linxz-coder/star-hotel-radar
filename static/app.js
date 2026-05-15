@@ -2,6 +2,8 @@ const form = document.getElementById("search-form");
 const submitBtn = document.getElementById("submit-btn");
 const errorBox = document.getElementById("error-box");
 const loadingBox = document.getElementById("loading-box");
+const exportPdfBtn = document.getElementById("export-pdf-btn");
+const exportPdfHint = document.getElementById("export-pdf-hint");
 const compareNoticeBox = document.getElementById("compare-notice");
 const sourcePill = document.getElementById("source-pill");
 const candidateCount = document.getElementById("candidate-count");
@@ -53,6 +55,7 @@ let latestSuggestions = [];
 let latestHotTargets = [];
 let suggestionRequestId = 0;
 let searchRequestId = 0;
+let pdfExporting = false;
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -424,6 +427,88 @@ function setError(message) {
   errorBox.classList.toggle("hidden", !message);
 }
 
+function exportableHotelCount(data) {
+  if (!data) return 0;
+  if (Array.isArray(data.allHotels) && data.allHotels.length) return data.allHotels.length;
+  const seen = new Set();
+  for (const hotel of [...(data.dealHotels || []), ...(data.recommendedHotels || [])]) {
+    if (!hotel) continue;
+    const key = hotel.hotelId || hotel.hotelName || hotel.hotelOriginalName || JSON.stringify(hotel);
+    seen.add(key);
+  }
+  return seen.size;
+}
+
+function setExportState() {
+  if (!exportPdfBtn || !exportPdfHint) return;
+  const count = exportableHotelCount(latestData);
+  exportPdfBtn.disabled = !count || pdfExporting;
+  exportPdfBtn.textContent = pdfExporting ? "正在生成 PDF..." : "导出 PDF";
+  if (!count) {
+    exportPdfHint.textContent = "搜索出酒店后可导出本次完整记录";
+    return;
+  }
+  const stillSearching = Boolean(latestData?.summary?.partial || latestData?.summary?.refreshing);
+  exportPdfHint.textContent = stillSearching
+    ? `可先导出当前 ${count} 家酒店，后台刷新后可再次导出`
+    : `导出本次搜索记录，包含 ${count} 家酒店`;
+}
+
+function filenameFromDisposition(disposition) {
+  const header = String(disposition || "");
+  const encoded = header.match(/filename\*=UTF-8''([^;]+)/i);
+  if (encoded?.[1]) {
+    try {
+      return decodeURIComponent(encoded[1].replaceAll("+", "%20"));
+    } catch (error) {
+      return encoded[1];
+    }
+  }
+  const plain = header.match(/filename="?([^";]+)"?/i);
+  return plain?.[1] || "";
+}
+
+async function exportCurrentPdf() {
+  if (!latestData || !exportableHotelCount(latestData) || pdfExporting) return;
+  pdfExporting = true;
+  setError("");
+  setExportState();
+  let successMessage = "";
+  try {
+    const response = await fetch("/api/export/pdf", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({result: latestData}),
+    });
+    if (!response.ok) {
+      let errorMessage = "PDF 导出失败";
+      try {
+        const data = await response.json();
+        errorMessage = data.error || errorMessage;
+      } catch (error) {
+        errorMessage = await response.text() || errorMessage;
+      }
+      throw new Error(errorMessage);
+    }
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filenameFromDisposition(response.headers.get("Content-Disposition")) || "星级酒店捡漏雷达搜索记录.pdf";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    successMessage = "PDF 已生成，后台结果刷新后可再次导出";
+  } catch (error) {
+    setError(error.message || String(error));
+  } finally {
+    pdfExporting = false;
+    setExportState();
+    if (successMessage && exportPdfHint) exportPdfHint.textContent = successMessage;
+  }
+}
+
 function formPayload() {
   const data = new FormData(form);
   const payload = {};
@@ -627,6 +712,7 @@ function renderResult(data) {
   recommendList.innerHTML = recommended.length
     ? recommended.map((hotel) => hotelCard(hotel, "brand")).join("")
     : emptyState(allRecommended.length ? "没有符合当前筛选的高端连锁酒店，可重置关键词或价格范围。" : (summary.partial ? "连锁品牌推荐会在候选酒店返回后自动刷新。" : "当前筛选条件下没有命中指定高端连锁品牌。"));
+  setExportState();
 }
 
 function clearSearchPoll() {
@@ -731,6 +817,7 @@ async function runSearch() {
   clearSearchPoll();
   setError("");
   latestData = null;
+  setExportState();
   setLoading(true, "搜索任务准备中...");
   try {
     const response = await fetch("/api/search", {
@@ -766,6 +853,8 @@ form.addEventListener("submit", (event) => {
   event.preventDefault();
   runSearch();
 });
+
+exportPdfBtn?.addEventListener("click", exportCurrentPdf);
 
 form.elements.selectedDate.addEventListener("change", updateCompareDates);
 form.elements.city.addEventListener("input", () => {
@@ -862,3 +951,4 @@ document.addEventListener("click", (event) => {
 renderHotTargets(window.__HOT_TARGETS__ || []);
 fetchHotTargets();
 updateCompareDates();
+setExportState();

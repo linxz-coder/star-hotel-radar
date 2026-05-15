@@ -43,7 +43,12 @@ def sample_result(sort_by: str = "discount") -> dict:
         },
     ]
     return {
-        "query": {"sortBy": sort_by},
+        "query": {
+            "city": "深圳",
+            "targetHotel": "深圳国际会展中心",
+            "selectedDate": "2026-06-01",
+            "sortBy": sort_by,
+        },
         "targetHotel": {},
         "compareDates": ["2026-06-01"],
         "allHotels": hotels,
@@ -51,6 +56,51 @@ def sample_result(sort_by: str = "discount") -> dict:
         "recommendedHotels": hotels,
         "summary": {"dealCount": 2, "recommendedCount": 2},
     }
+
+
+def test_export_pdf_uses_current_search_result(monkeypatch):
+    app_module = importlib.import_module("app")
+    captured = {}
+
+    def fake_render(result):
+        captured["result"] = result
+        return b"%PDF-1.4\nfake"
+
+    monkeypatch.setattr(app_module, "render_search_result_pdf", fake_render)
+
+    with app_module.app.test_client() as client:
+        response = client.post("/api/export/pdf", json={"result": sample_result("discount")})
+
+    assert response.status_code == 200
+    assert response.mimetype == "application/pdf"
+    assert response.data.startswith(b"%PDF")
+    assert captured["result"]["allHotels"][0]["hotelName"] == "高价高优惠酒店"
+    assert "filename*=UTF-8''" in response.headers["Content-Disposition"]
+
+
+def test_export_pdf_rejects_empty_search_record():
+    app_module = importlib.import_module("app")
+
+    with app_module.app.test_client() as client:
+        response = client.post(
+            "/api/export/pdf",
+            json={"result": {"allHotels": [], "dealHotels": [], "recommendedHotels": []}},
+        )
+
+    assert response.status_code == 400
+    assert "还没有酒店结果" in response.get_json()["error"]
+
+
+def test_export_pdf_html_includes_all_hotel_sections():
+    app_module = importlib.import_module("app")
+
+    html = app_module.build_search_result_pdf_html(sample_result("discount"))
+
+    assert "适合捡漏的酒店" in html
+    assert "知名高端连锁推荐酒店" in html
+    assert "全部附近星级候选酒店" in html
+    assert "高价高优惠酒店" in html
+    assert "低价酒店" in html
 
 
 def test_search_cache_ignores_sort_and_reuses_result(monkeypatch, tmp_path):
