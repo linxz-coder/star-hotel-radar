@@ -931,7 +931,9 @@ class TripComProvider:
                 filtered.append(item)
                 self._candidate_cache[hotel_id] = item
                 if self._hotel_price_matches_date(hotel, selected_date):
-                    self._store_price_if_available(hotel_id, selected_date, hotel.get("currentPrice"))
+                    self._price_cache.setdefault(hotel_id, {})[selected_date] = hotel.get("currentPrice")
+                    if hotel.get("priceIncludesTax") is True:
+                        self._store_price_if_available(hotel_id, selected_date, hotel.get("currentPrice"))
         return filtered
 
     def _hotel_price_matches_date(self, hotel: dict[str, Any], selected_date: str) -> bool:

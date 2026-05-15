@@ -1650,6 +1650,8 @@ def persist_result_hotel_date_prices(provider_name: str, result: dict[str, Any])
     result_compare_dates = [str(date) for date in (result.get("compareDates") or []) if str(date or "").strip()]
     rows: dict[tuple[str, str], tuple[int, str]] = {}
     for hotel in iter_unique_result_hotels(result):
+        if hotel.get("priceCarriedFromCache") or hotel.get("carriedFromCache"):
+            continue
         hotel_id = str(hotel.get("hotelId") or "").strip()
         if not hotel_id:
             continue

@@ -672,6 +672,34 @@ def test_current_price_results_can_stream_raw_candidates_before_name_and_price_f
     assert unknown["nameProcessing"] is True
 
 
+def test_current_price_results_reuse_cached_selected_date_price():
+    class FakeCachedCurrentPriceProvider(FakeUnpricedProvider):
+        def __init__(self):
+            self.cache_requests = []
+
+        def get_cached_hotel_prices(self, hotel_ids, dates):
+            self.cache_requests.append((list(hotel_ids), list(dates)))
+            return {"pending-price": {"2026-06-01": 620}}
+
+    provider = FakeCachedCurrentPriceProvider()
+    result = search_current_prices(
+        provider=provider,
+        city="广州",
+        target_hotel_name="广州珠江新城",
+        selected_date="2026-06-01",
+        radius_km=3,
+    )
+
+    hotel = result["allHotels"][0]
+    assert provider.cache_requests == [(["pending-price"], ["2026-06-01"])]
+    assert hotel["currentPrice"] == 620
+    assert hotel["priceIncludesTax"] is True
+    assert hotel["pricePending"] is False
+    assert hotel["priceSource"] == "MySQL 酒店日期含税价缓存"
+    assert result["summary"]["pricedHotelCount"] == 1
+    assert result["summary"]["unpricedCandidateCount"] == 0
+
+
 def test_search_deals_keeps_unpriced_star_candidates_visible():
     result = search_deals(
         provider=FakeUnpricedProvider(),

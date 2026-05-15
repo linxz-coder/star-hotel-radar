@@ -937,6 +937,56 @@ def test_remember_search_result_persists_selected_and_compare_prices(monkeypatch
     assert {item["provider"] for item in stored} == {app_module.TripComProvider.source_name}
 
 
+def test_remember_search_result_does_not_refresh_carried_cache_prices(monkeypatch, tmp_path):
+    app_module = importlib.import_module("app")
+    monkeypatch.setattr(app_module, "SEARCH_CACHE_DIR", tmp_path / "search_cache")
+    app_module.SEARCH_CACHE.clear()
+    stored: list[dict[str, object]] = []
+
+    class FakePriceCache:
+        def store_price(self, provider_name, **kwargs):
+            stored.append({"provider": provider_name, **kwargs})
+
+    monkeypatch.setattr(app_module, "MYSQL_HOTEL_PRICE_CACHE", FakePriceCache())
+    key = app_module.cache_key(
+        {
+            "city": "深圳",
+            "targetHotel": "深圳国际会展中心",
+            "selectedDate": "2026-06-01",
+            "radiusKm": "3",
+            "minStar": "4",
+            "provider": "tripcom",
+        }
+    )
+    result = sample_result("discount")
+    result["compareDates"] = ["2026-06-01", "2026-06-02"]
+    result["allHotels"][0].update(
+        {
+            "selectedDate": "2026-06-01",
+            "priceIncludesTax": True,
+            "compareDates": result["compareDates"],
+            "comparePrices": [900, 980],
+            "priceCarriedFromCache": True,
+        }
+    )
+    result["allHotels"][1].update(
+        {
+            "selectedDate": "2026-06-01",
+            "priceIncludesTax": True,
+            "compareDates": result["compareDates"],
+            "comparePrices": [500, 620],
+        }
+    )
+
+    app_module.remember_search_result(key, "tripcom", result)
+
+    stored_keys = {(str(item["hotel_id"]), str(item["price_date"])) for item in stored}
+    assert ("expensive", "2026-06-01") not in stored_keys
+    assert ("expensive", "2026-06-02") not in stored_keys
+    assert ("cheap", "2026-06-01") in stored_keys
+    assert ("cheap", "2026-06-02") in stored_keys
+
+
 def test_target_only_partial_result_is_cached_for_resume(monkeypatch, tmp_path):
     app_module = importlib.import_module("app")
     monkeypatch.setattr(app_module, "SEARCH_CACHE_DIR", tmp_path / "search_cache")

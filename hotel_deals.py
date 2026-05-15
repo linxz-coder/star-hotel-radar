@@ -1035,15 +1035,33 @@ def current_price_result_from_hotels(
 ) -> dict[str, Any]:
     enriched_hotels: list[dict[str, Any]] = []
     provisional_name_count = 0
+    selected_value = selected.isoformat()
+    hotel_ids = [
+        str(hotel.get("hotelId") or "").strip()
+        for hotel in nearby_hotels
+        if str(hotel.get("hotelId") or "").strip()
+    ]
+    price_map: dict[str, dict[str, int | float | None]] = {}
+    merge_known_price_cache(provider, price_map, hotel_ids, [selected_value])
     for hotel in nearby_hotels:
         hotel_id = str(hotel.get("hotelId") or "")
-        current_price = hotel_price_for_selected_date(hotel, selected.isoformat())
         if not hotel_id:
             continue
+        item_source = dict(hotel)
+        current_price = hotel_price_for_selected_date(item_source, selected_value)
+        if current_price in (None, ""):
+            cached_price = price_map.get(hotel_id, {}).get(selected_value)
+            if cached_price not in (None, ""):
+                item_source["currentPrice"] = cached_price
+                item_source["selectedDate"] = selected_value
+                item_source["priceDate"] = selected_value
+                item_source["priceIncludesTax"] = True
+                item_source["priceSource"] = item_source.get("priceSource") or "MySQL 酒店日期含税价缓存"
+                current_price = cached_price
         has_current_price = current_price not in (None, "")
-        brand_payload = hotel_brand_payload(hotel)
+        brand_payload = hotel_brand_payload(item_source)
         item = hotel_result_payload(
-            hotel,
+            item_source,
             hotel_id=hotel_id,
             selected=selected,
             compare_dates=compare_dates,
