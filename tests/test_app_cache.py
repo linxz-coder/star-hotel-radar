@@ -103,6 +103,14 @@ def test_export_pdf_html_includes_all_hotel_sections():
     assert "低价酒店" in html
 
 
+def test_export_pdf_html_defaults_to_distance_order():
+    app_module = importlib.import_module("app")
+
+    html = app_module.build_search_result_pdf_html(sample_result("discount"))
+
+    assert html.find("低价酒店") < html.find("高价高优惠酒店")
+
+
 def test_search_cache_ignores_sort_and_reuses_result(monkeypatch, tmp_path):
     app_module = importlib.import_module("app")
     monkeypatch.setattr(app_module, "SEARCH_CACHE_DIR", tmp_path)

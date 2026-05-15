@@ -177,6 +177,27 @@ def export_price_delta(hotel: dict[str, Any]) -> tuple[str, str]:
     return "持平", "neutral"
 
 
+def export_sort_number(value: Any, default: float) -> float:
+    if value in (None, ""):
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def export_hotels_by_distance(hotels: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(
+        hotels,
+        key=lambda hotel: (
+            export_sort_number(hotel.get("distanceKm"), 999999),
+            export_sort_number(hotel.get("currentPrice"), 999999999),
+            -export_sort_number(hotel.get("starRating"), 0),
+            export_hotel_name(hotel),
+        ),
+    )
+
+
 def export_hotel_table(hotels: list[dict[str, Any]], *, title: str, empty_text: str) -> str:
     rows: list[str] = []
     for index, hotel in enumerate(hotels, start=1):
@@ -236,9 +257,15 @@ def build_search_result_pdf_html(result: dict[str, Any]) -> str:
     query = result.get("query") if isinstance(result.get("query"), dict) else {}
     summary = result.get("summary") if isinstance(result.get("summary"), dict) else {}
     compare_dates = result.get("compareDates") or []
-    all_hotels = [hotel for hotel in (result.get("allHotels") or []) if isinstance(hotel, dict)]
-    deal_hotels = [hotel for hotel in (result.get("dealHotels") or []) if isinstance(hotel, dict)]
-    recommended_hotels = [hotel for hotel in (result.get("recommendedHotels") or []) if isinstance(hotel, dict)]
+    all_hotels = export_hotels_by_distance(
+        [hotel for hotel in (result.get("allHotels") or []) if isinstance(hotel, dict)]
+    )
+    deal_hotels = export_hotels_by_distance(
+        [hotel for hotel in (result.get("dealHotels") or []) if isinstance(hotel, dict)]
+    )
+    recommended_hotels = export_hotels_by_distance(
+        [hotel for hotel in (result.get("recommendedHotels") or []) if isinstance(hotel, dict)]
+    )
     generated_at = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
     city = export_text(query.get("city"))
     target = export_text(query.get("targetHotel"))
