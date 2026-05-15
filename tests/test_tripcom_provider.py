@@ -587,7 +587,7 @@ def test_get_hotel_prices_uses_persistent_price_cache(monkeypatch):
     assert prices["40365204"]["2026-06-02"] == 356
 
 
-def test_force_refresh_bypasses_persistent_price_cache(monkeypatch):
+def test_force_refresh_bypasses_persistent_price_cache_reads_but_stores_fresh(monkeypatch):
     provider = TripComProvider()
     provider._last_target = target_hotel()
     provider._last_search_targets = [target_hotel()]
@@ -601,12 +601,14 @@ def test_force_refresh_bypasses_persistent_price_cache(monkeypatch):
         }
     }
 
+    stored: list[dict[str, object]] = []
+
     class FakePriceCache:
         def get_many(self, *args, **kwargs):
             pytest.fail("force refresh should bypass persistent price cache reads")
 
-        def store_price(self, *args, **kwargs):
-            pytest.fail("force refresh should bypass persistent price cache writes")
+        def store_price(self, provider_name, **kwargs):
+            stored.append({"provider": provider_name, **kwargs})
 
     provider.set_persistent_price_cache(FakePriceCache(), bypass=True, ttl_seconds=86400)
     monkeypatch.setattr(provider, "_fetch_hotel_list_for_date", lambda *args, **kwargs: [])
@@ -628,6 +630,10 @@ def test_force_refresh_bypasses_persistent_price_cache(monkeypatch):
     prices = provider.get_hotel_prices(["40365204"], ["2026-06-02"])
 
     assert prices["40365204"]["2026-06-02"] == 401
+    assert stored
+    assert stored[0]["provider"] == provider.source_name
+    assert stored[0]["hotel_id"] == "40365204"
+    assert stored[0]["price_date"] == "2026-06-02"
 
 
 def test_tax_prices_are_stored_to_persistent_price_cache(monkeypatch):

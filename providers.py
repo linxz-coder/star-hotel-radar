@@ -931,7 +931,7 @@ class TripComProvider:
                 filtered.append(item)
                 self._candidate_cache[hotel_id] = item
                 if self._hotel_price_matches_date(hotel, selected_date):
-                    self._price_cache.setdefault(hotel_id, {})[selected_date] = hotel.get("currentPrice")
+                    self._store_price_if_available(hotel_id, selected_date, hotel.get("currentPrice"))
         return filtered
 
     def _hotel_price_matches_date(self, hotel: dict[str, Any], selected_date: str) -> bool:
@@ -1007,12 +1007,12 @@ class TripComProvider:
                     pass
 
     def _persistent_price_cache_available(self, *, write: bool = False) -> bool:
-        if self._bypass_persistent_price_cache:
-            return False
         cache = self._persistent_price_cache
         if cache is None:
             return False
-        if not write and self._persistent_price_cache_ttl_seconds <= 0:
+        if self._persistent_price_cache_ttl_seconds <= 0:
+            return False
+        if self._bypass_persistent_price_cache and not write:
             return False
         return True
 

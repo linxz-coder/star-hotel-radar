@@ -1610,6 +1610,88 @@ class ProgressiveNameVerifier:
                 self.publish_current_partial(phase="complete")
 
 
+def positive_int_price(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        price = int(round(float(value)))
+    except (TypeError, ValueError):
+        return None
+    return price if price > 0 else None
+
+
+def mysql_hotel_price_provider(provider_name: str) -> str:
+    canonical = canonical_provider_name(provider_name)
+    if canonical == "tripcom":
+        return TripComProvider.source_name
+    return canonical
+
+
+def iter_unique_result_hotels(result: dict[str, Any]) -> list[dict[str, Any]]:
+    hotels: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for list_name in ("allHotels", "dealHotels", "recommendedHotels"):
+        for hotel in result.get(list_name) or []:
+            if not isinstance(hotel, dict):
+                continue
+            key = hotel_merge_key(hotel) or f"object:{id(hotel)}"
+            if key in seen:
+                continue
+            seen.add(key)
+            hotels.append(hotel)
+    return hotels
+
+
+def persist_result_hotel_date_prices(provider_name: str, result: dict[str, Any]) -> int:
+    if MYSQL_HOTEL_PRICE_CACHE is None or canonical_provider_name(provider_name) != "tripcom":
+        return 0
+    query = result.get("query") if isinstance(result.get("query"), dict) else {}
+    selected_date = str(query.get("selectedDate") or "").strip()
+    result_compare_dates = [str(date) for date in (result.get("compareDates") or []) if str(date or "").strip()]
+    rows: dict[tuple[str, str], tuple[int, str]] = {}
+    for hotel in iter_unique_result_hotels(result):
+        hotel_id = str(hotel.get("hotelId") or "").strip()
+        if not hotel_id:
+            continue
+        hotel_selected_date = str(hotel.get("selectedDate") or selected_date or "").strip()
+        current_price = positive_int_price(hotel.get("currentPrice"))
+        if hotel_selected_date and current_price is not None and hotel.get("priceIncludesTax") is not False:
+            rows[(hotel_id, hotel_selected_date)] = (
+                current_price,
+                str(hotel.get("priceSource") or "search-result-selected-date"),
+            )
+
+        compare_dates = [str(date) for date in (hotel.get("compareDates") or result_compare_dates) if str(date or "").strip()]
+        compare_prices = list(hotel.get("comparePrices") or [])
+        for index, date_value in enumerate(compare_dates):
+            if index >= len(compare_prices):
+                continue
+            compare_price = positive_int_price(compare_prices[index])
+            if compare_price is None:
+                continue
+            rows[(hotel_id, date_value)] = (compare_price, "search-result-compare-date")
+
+    if not rows:
+        return 0
+    provider_key = mysql_hotel_price_provider(provider_name)
+    expires_at = time.time() + float(HOTEL_PRICE_CACHE_TTL_SECONDS)
+    stored_count = 0
+    for (hotel_id, price_date), (price, price_source) in rows.items():
+        try:
+            MYSQL_HOTEL_PRICE_CACHE.store_price(
+                provider_key,
+                hotel_id=hotel_id,
+                price_date=price_date,
+                current_price=price,
+                price_source=price_source,
+                expires_at=expires_at,
+            )
+            stored_count += 1
+        except Exception:
+            continue
+    return stored_count
+
+
 def remember_search_result(key: str, provider_name: str, result: dict[str, Any]) -> None:
     ttl_seconds = cache_ttl_seconds(provider_name)
     if ttl_seconds <= 0:
@@ -1617,6 +1699,7 @@ def remember_search_result(key: str, provider_name: str, result: dict[str, Any])
     if not cacheable_search_result(result):
         return
     remember_result_hotel_names(result, provider_name)
+    persist_result_hotel_date_prices(provider_name, result)
     now = time.time()
     expires_at = now + ttl_seconds
     if len(SEARCH_CACHE) >= MAX_SEARCH_CACHE_ITEMS:

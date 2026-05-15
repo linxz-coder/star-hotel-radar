@@ -881,6 +881,62 @@ def test_nonempty_partial_result_is_cached_without_stale_job_metadata(monkeypatc
     assert cached["summary"]["priceCompareComplete"] is False
 
 
+def test_remember_search_result_persists_selected_and_compare_prices(monkeypatch, tmp_path):
+    app_module = importlib.import_module("app")
+    monkeypatch.setattr(app_module, "SEARCH_CACHE_DIR", tmp_path / "search_cache")
+    app_module.SEARCH_CACHE.clear()
+    stored: list[dict[str, object]] = []
+
+    class FakePriceCache:
+        def store_price(self, provider_name, **kwargs):
+            stored.append({"provider": provider_name, **kwargs})
+
+    monkeypatch.setattr(app_module, "MYSQL_HOTEL_PRICE_CACHE", FakePriceCache())
+    key = app_module.cache_key(
+        {
+            "city": "深圳",
+            "targetHotel": "深圳国际会展中心",
+            "selectedDate": "2026-06-01",
+            "radiusKm": "3",
+            "minStar": "4",
+            "provider": "tripcom",
+        }
+    )
+    result = sample_result("discount")
+    result["compareDates"] = ["2026-06-01", "2026-06-02", "2026-06-08", "2026-06-09"]
+    result["allHotels"][0].update(
+        {
+            "selectedDate": "2026-06-01",
+            "priceIncludesTax": True,
+            "priceSource": "Trip.com tax-inclusive field",
+            "compareDates": result["compareDates"],
+            "comparePrices": [900, 980, 1100, 1080],
+        }
+    )
+    result["allHotels"][1].update(
+        {
+            "selectedDate": "2026-06-01",
+            "priceIncludesTax": True,
+            "compareDates": result["compareDates"],
+            "comparePrices": [500, 620, None, 700],
+        }
+    )
+
+    app_module.remember_search_result(key, "tripcom", result)
+
+    stored_by_key = {
+        (str(item["hotel_id"]), str(item["price_date"])): item
+        for item in stored
+    }
+    assert stored_by_key[("expensive", "2026-06-01")]["current_price"] == 900
+    assert stored_by_key[("expensive", "2026-06-02")]["current_price"] == 980
+    assert stored_by_key[("expensive", "2026-06-08")]["current_price"] == 1100
+    assert stored_by_key[("expensive", "2026-06-09")]["current_price"] == 1080
+    assert stored_by_key[("cheap", "2026-06-02")]["current_price"] == 620
+    assert ("cheap", "2026-06-08") not in stored_by_key
+    assert {item["provider"] for item in stored} == {app_module.TripComProvider.source_name}
+
+
 def test_target_only_partial_result_is_cached_for_resume(monkeypatch, tmp_path):
     app_module = importlib.import_module("app")
     monkeypatch.setattr(app_module, "SEARCH_CACHE_DIR", tmp_path / "search_cache")
