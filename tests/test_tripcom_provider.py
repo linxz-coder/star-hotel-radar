@@ -808,6 +808,25 @@ def test_html_list_parser_keeps_visible_price_pending_when_tax_missing():
     assert provider.get_cached_hotel_prices(["40365204"], ["2026-06-01"])["40365204"] == {}
 
 
+def test_html_list_parser_accepts_chinese_tax_total_text():
+    provider = TripComProvider()
+    html = """
+    <div class="list-item"><div class="hotel-card" id="40365204">
+      <span class="hotelName">深圳国际会展中心希尔顿花园酒店</span>
+      <div class="hotelStar" aria-label="4 out of 5 stars"></div>
+      <span class="position-desc">2.3 km from Shenzhen World Exhibition &amp; Convention Center</span>
+      <div>总价（含税及费用）：CNY 356</div>
+    </div></div>
+    """
+    target = {**target_hotel(), "hotelId": "landmark", "hotelName": "深圳国际会展中心"}
+
+    hotels = provider._hotel_cards_from_html(html, dt.date(2026, 6, 1), dt.date(2026, 6, 2), target)
+
+    assert hotels[0]["currentPrice"] == 356
+    assert hotels[0]["visiblePrice"] is None
+    assert hotels[0]["priceIncludesTax"] is True
+
+
 def test_html_list_parser_keeps_star_hotel_without_price():
     provider = TripComProvider()
     html = """

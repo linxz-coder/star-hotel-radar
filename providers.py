@@ -2582,6 +2582,10 @@ Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
         )
         if tax_match:
             return int(tax_match.group(1).replace(",", "")), True
+        for match in re.finditer(r"CNY\s*([\d,]+)", card, flags=re.IGNORECASE):
+            window = card[max(0, match.start() - 80) : min(len(card), match.end() + 80)]
+            if re.search(r"incl|tax|fees?|含税|税费|总价", window, flags=re.IGNORECASE):
+                return int(match.group(1).replace(",", "")), True
         sale_match = re.search(r"(?:Current price\s*)?CNY\s*([\d,]+)", card, flags=re.IGNORECASE)
         if sale_match:
             return int(sale_match.group(1).replace(",", "")), False
