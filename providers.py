@@ -13,7 +13,7 @@ import threading
 import uuid
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlencode
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 from hotel_deals import HotelDealError, detectHotelBrand, haversine_km, parse_date
@@ -1080,6 +1080,27 @@ class TripComProvider:
                 break
         return fetched
 
+    def _hotel_city_id(self, hotel: dict[str, Any], target: dict[str, Any] | None = None) -> int:
+        for value in (hotel.get("cityId"), hotel.get("hotelCityId")):
+            try:
+                city_id = int(value or 0)
+            except (TypeError, ValueError):
+                city_id = 0
+            if city_id:
+                return city_id
+        trip_url = str(hotel.get("tripUrl") or "")
+        if trip_url:
+            try:
+                city_id = int((parse_qs(urlparse(trip_url).query).get("cityId") or ["0"])[0] or 0)
+            except (TypeError, ValueError):
+                city_id = 0
+            if city_id:
+                return city_id
+        try:
+            return int((target or {}).get("cityId") or 0)
+        except (TypeError, ValueError):
+            return 0
+
     def _fetch_detail_context_with_seed_retry(
         self,
         seed_hotel: dict[str, Any],
@@ -1594,7 +1615,7 @@ class TripComProvider:
         checkout_date = checkin_date + dt.timedelta(days=1)
         target = self._last_target or {}
         hotel_id = str(seed_hotel.get("hotelId") or "")
-        city_id = int(seed_hotel.get("cityId") or target.get("cityId") or 0)
+        city_id = self._hotel_city_id(seed_hotel, target)
         if not hotel_id or not city_id:
             return None
 
@@ -1661,7 +1682,7 @@ class TripComProvider:
         checkout_date = checkin_date + dt.timedelta(days=1)
         target = self._last_target or {}
         hotel_id = str(seed_hotel.get("hotelId") or "")
-        city_id = int(seed_hotel.get("cityId") or target.get("cityId") or 0)
+        city_id = self._hotel_city_id(seed_hotel, target)
         if not hotel_id or not city_id:
             return []
 
@@ -1680,6 +1701,7 @@ class TripComProvider:
         def seed_item_from_room_price(price: int) -> dict[str, Any]:
             item = dict(seed_hotel)
             item.setdefault("city", simplify_chinese_text(target.get("city") or ""))
+            item["cityId"] = city_id
             item["currentPrice"] = price
             item["priceDate"] = checkin_date.isoformat()
             item["priceIncludesTax"] = True
@@ -1851,13 +1873,15 @@ Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
         star = self._coerce_float_value(hotel_level.get("star") or hotel_level.get("dStar")) or 0
         rating = self._coerce_float_value(comment.get("score"))
         score_max = self._coerce_float_value(comment.get("scoreMax")) or 10
+        city_id = position.get("cityId") or basic.get("cityId") or target.get("cityId") or 0
         return {
             "hotelId": hotel_id,
             "hotelName": hotel_name,
             "hotelOriginalName": name_payload["hotelOriginalName"],
             "hotelNameSimplified": name_payload["hotelNameSimplified"],
             "hotelNameSource": name_payload["hotelNameSource"],
-            "city": simplify_chinese_text(target.get("city") or ""),
+            "city": simplify_chinese_text(position.get("cityName") or target.get("city") or ""),
+            "cityId": int(city_id or 0),
             "brand": detected.get("brand") or "",
             "group": detected.get("group") or "",
             "starRating": min(5.0, float(star or 0)),
@@ -1869,7 +1893,7 @@ Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
             "priceIncludesTax": price is not None,
             "priceSource": "Trip.com detail nearby after-tax price" if price is not None else "",
             "imageUrl": basic.get("imageUrl") or basic.get("imageUrlOfCtrip") or "",
-            "tripUrl": self._detail_url(hotel_id, target.get("cityId") or 0, check_in, check_out),
+            "tripUrl": self._detail_url(hotel_id, city_id, check_in, check_out),
             "rating": round(float(rating) / float(score_max) * 5, 1) if rating and score_max and score_max > 5 else rating,
             "reviewCount": self._extract_detail_review_count(comment),
             "source": self.source_name,
@@ -2402,6 +2426,7 @@ Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
                     "hotelNameSimplified": name_payload["hotelNameSimplified"],
                     "hotelNameSource": name_payload["hotelNameSource"],
                     "city": simplify_chinese_text(target.get("city") or ""),
+                    "cityId": int(city_id or 0),
                     "brand": detected.get("brand") or "",
                     "group": detected.get("group") or "",
                     "starRating": self._extract_html_card_star(card),
@@ -2544,7 +2569,7 @@ Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
         if not coordinates:
             return None
         detected = detectHotelBrand(hotel_name) or {}
-        city_id = target.get("cityId") or position.get("cityId") or 0
+        city_id = position.get("cityId") or target.get("cityId") or 0
         trip_url = self._detail_url(hotel_id, city_id, check_in, check_out)
         return {
             "hotelId": hotel_id,
@@ -2553,6 +2578,7 @@ Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
             "hotelNameSimplified": name_payload["hotelNameSimplified"],
             "hotelNameSource": name_payload["hotelNameSource"],
             "city": simplify_chinese_text(position.get("cityName") or target.get("city") or ""),
+            "cityId": int(city_id or 0),
             "brand": detected.get("brand") or "",
             "group": detected.get("group") or "",
             "starRating": self._extract_star(row),

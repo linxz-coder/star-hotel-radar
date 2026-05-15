@@ -2,6 +2,7 @@ const form = document.getElementById("search-form");
 const submitBtn = document.getElementById("submit-btn");
 const errorBox = document.getElementById("error-box");
 const loadingBox = document.getElementById("loading-box");
+const priceStatusBox = document.getElementById("price-status-box");
 const exportPdfBtn = document.getElementById("export-pdf-btn");
 const exportPdfHint = document.getElementById("export-pdf-hint");
 const compareNoticeBox = document.getElementById("compare-notice");
@@ -204,6 +205,20 @@ function nameVerificationBar(hotel) {
   `;
 }
 
+function pricePendingBar(hotel) {
+  if (!hotel.pricePending) return "";
+  const stillSearching = Boolean(latestData?.summary?.partial || latestData?.summary?.refreshing);
+  const text = stillSearching
+    ? "正在继续查询该酒店目标日期含税价，查到后会自动刷新"
+    : "本轮未拿到该酒店目标日期含税价，已保留为待补价候选";
+  return `
+    <div class="price-pending-bar">
+      <span>${escapeHtml(text)}</span>
+      <i aria-hidden="true"></i>
+    </div>
+  `;
+}
+
 function priceDeltaTone(discountValue, hasDiscount) {
   if (!hasDiscount || !Number.isFinite(discountValue)) return "neutral";
   if (discountValue > 0) return "positive";
@@ -241,10 +256,11 @@ function hotelCard(hotel, mode) {
         </div>
         <div class="hotel-meta">${hotelMeta(hotel)}</div>
         ${nameVerificationBar(hotel)}
+        ${pricePendingBar(hotel)}
         <div class="price-grid">
-          <div class="price-cell">
+          <div class="price-cell ${hotel.pricePending ? "price-cell--pending" : ""}">
             <span>目标日期价格</span>
-            <strong>${currency(hotel.currentPrice)}</strong>
+            <strong>${hotel.pricePending ? "待补价" : currency(hotel.currentPrice)}</strong>
           </div>
           <div class="price-cell">
             <span>${escapeHtml(referenceLabel)}</span>
@@ -349,6 +365,34 @@ function setCompareNotice(text) {
   if (!compareNoticeBox) return;
   compareNoticeBox.textContent = text || "";
   compareNoticeBox.classList.toggle("hidden", !text);
+}
+
+function priceStatusText(summary = {}) {
+  const priceProgress = summary.priceProgress || {};
+  const missing = Number(priceProgress.missingHotelCount ?? summary.unpricedCandidateCount ?? 0);
+  const priced = Number(priceProgress.pricedHotelCount ?? summary.pricedHotelCount ?? 0);
+  const total = Number(priceProgress.totalHotels ?? summary.candidateCount ?? 0);
+  const dateValue = priceProgress.date || "";
+  if (summary.partial || summary.refreshing) {
+    if (total && Number.isFinite(missing) && missing > 0) {
+      const dateLabel = dateValue ? `${dateValue} ` : "";
+      return `正在补齐${dateLabel}酒店含税价：已匹配 ${Number.isFinite(priced) ? priced : 0}/${total} 家，仍有 ${missing} 家待补价。`;
+    }
+    if (total && Number.isFinite(priced) && priced > 0) {
+      return `正在补齐酒店含税价：已匹配 ${priced}/${total} 家，结果会继续刷新。`;
+    }
+  }
+  if (!summary.partial && Number.isFinite(missing) && missing > 0) {
+    return `本轮搜索完成后仍有 ${missing}/${total || "若干"} 家酒店未拿到目标日期含税价，已保留为“待补价”候选；Trip.com 后续返回价格或重新实时搜索时会继续补齐。`;
+  }
+  return "";
+}
+
+function setPriceStatus(summary = {}) {
+  if (!priceStatusBox) return;
+  const text = priceStatusText(summary);
+  priceStatusBox.textContent = text;
+  priceStatusBox.classList.toggle("hidden", !text);
 }
 
 function sortedHotels(items, mode, summary = {}) {
@@ -677,6 +721,7 @@ function renderResult(data) {
     ? `公众假期对比：${(data.compareDates || []).join("、") || "-"}`
     : ((data.compareDates || []).join("、") || "-");
   setCompareNotice(holidayNotice);
+  setPriceStatus(summary);
   const expanded = summary.radiusExpanded
     ? `｜已扩展至 ${Number(summary.effectiveRadiusKm).toFixed(0)}km`
     : "";
@@ -820,6 +865,7 @@ async function runSearch() {
   setError("");
   latestData = null;
   setExportState();
+  setPriceStatus({});
   setLoading(true, "搜索任务准备中...");
   try {
     const response = await fetch("/api/search", {

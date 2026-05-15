@@ -830,6 +830,7 @@ def hotel_result_payload(
         "hotelNameSimplified": hotel_name_payload["hotelNameSimplified"] or hotel.get("hotelNameSimplified") or "",
         "hotelNameSource": hotel_name_payload["hotelNameSource"] or hotel.get("hotelNameSource") or "",
         "city": simplify_chinese_text(hotel.get("city") or city or ""),
+        "cityId": hotel.get("cityId") or "",
         "brand": brand_payload.get("brand") or hotel.get("brand") or "独立酒店",
         "brandLabel": brand_payload.get("brandLabel") or hotel.get("brand") or "独立酒店",
         "group": brand_payload.get("group") or hotel.get("group") or "",

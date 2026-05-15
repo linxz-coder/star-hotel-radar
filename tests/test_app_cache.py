@@ -114,6 +114,19 @@ def test_export_pdf_html_defaults_to_distance_order():
     assert html.find("低价酒店") < html.find("高价高优惠酒店")
 
 
+def test_final_search_progress_reports_pending_prices():
+    app_module = importlib.import_module("app")
+    result = sample_result("discount")
+    result["summary"]["candidateCount"] = 2
+    result["summary"]["unpricedCandidateCount"] = 1
+
+    progress = app_module.final_search_progress(result, 1000)
+
+    assert progress["stage"] == "complete-with-pending-price"
+    assert "仍有 1/2 家酒店" in progress["message"]
+    assert "待补价" in progress["message"]
+
+
 def test_search_cache_ignores_sort_and_reuses_result(monkeypatch, tmp_path):
     app_module = importlib.import_module("app")
     monkeypatch.setattr(app_module, "SEARCH_CACHE_DIR", tmp_path)

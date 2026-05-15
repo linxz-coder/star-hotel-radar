@@ -512,6 +512,18 @@ def test_get_hotel_prices_opens_own_detail_when_list_card_has_no_price(monkeypat
     assert prices["40365204"]["2026-06-02"] == 777
 
 
+def test_detail_context_recovers_city_id_from_cached_trip_url():
+    provider = TripComProvider()
+    provider._last_target = target_hotel()
+    seed = {
+        "hotelId": "40365204",
+        "hotelName": "缓存待补价酒店",
+        "tripUrl": "https://www.trip.com/hotels/detail/?hotelId=40365204&cityId=251",
+    }
+
+    assert provider._hotel_city_id(seed, target_hotel()) == 251
+
+
 def test_get_hotel_prices_retries_detail_seed_when_seed_price_missing(monkeypatch):
     provider = TripComProvider()
     provider._last_target = target_hotel()
@@ -763,6 +775,8 @@ def test_trip_hotel_normalizer_keeps_star_hotel_without_price():
 
     assert item is not None
     assert item["hotelName"] == "广州珠江新城假日酒店"
+    assert item["cityId"] == 32
+    assert parse_qs(urlparse(item["tripUrl"]).query)["cityId"] == ["32"]
     assert item["currentPrice"] is None
     assert item["priceDate"] == ""
     assert item["priceIncludesTax"] is False

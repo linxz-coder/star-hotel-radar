@@ -53,7 +53,7 @@ MAX_SEARCH_CACHE_ITEMS = 256
 MAX_HOT_SEARCH_RECORDS = 80
 HOT_SEARCH_TTL_SECONDS = 30 * 24 * 60 * 60
 HOTEL_NAME_CACHE_TTL_SECONDS = int(os.environ.get("HOTEL_DEAL_NAME_CACHE_TTL_SECONDS", str(365 * 24 * 60 * 60)))
-CACHE_LOGIC_VERSION = "search_v37_pending_price_detail_backfill"
+CACHE_LOGIC_VERSION = "search_v38_city_id_price_progress"
 MYSQL_SEARCH_CACHE = MySQLSearchCache.from_env()
 MYSQL_HOTEL_NAME_CACHE = MySQLHotelNameCache.from_env()
 HOTEL_NAME_CACHE_LOCK = threading.RLock()
@@ -1536,6 +1536,25 @@ def job_progress(stage: str, message: str, started_at: float | None = None) -> d
     }
 
 
+def final_search_progress(result: dict[str, Any], started_at: float | None = None) -> dict[str, Any]:
+    summary = result.get("summary") if isinstance(result.get("summary"), dict) else {}
+    try:
+        unpriced_count = int(summary.get("unpricedCandidateCount") or 0)
+    except (TypeError, ValueError):
+        unpriced_count = 0
+    try:
+        candidate_count = int(summary.get("candidateCount") or len(result.get("allHotels") or []) or 0)
+    except (TypeError, ValueError):
+        candidate_count = 0
+    if unpriced_count > 0:
+        return job_progress(
+            "complete-with-pending-price",
+            f"完整比价已完成，仍有 {unpriced_count}/{candidate_count} 家酒店本轮未拿到目标日期含税价，已在结果中标为待补价。",
+            started_at,
+        )
+    return job_progress("complete", "完整比价已完成。", started_at)
+
+
 def update_search_job(job_id: str, **updates: Any) -> None:
     with SEARCH_JOB_LOCK:
         job = SEARCH_JOBS.get(job_id)
@@ -1864,11 +1883,15 @@ def start_background_search_job(
             result["summary"]["partial"] = False
             result["summary"]["jobStatus"] = "complete"
             result["summary"]["jobId"] = job_id
-            result["summary"]["progress"] = job_progress(
-                "complete",
-                "完整比价已完成。",
-                SEARCH_JOBS[job_id]["startedAt"],
-            )
+            result["summary"]["progress"] = final_search_progress(result, SEARCH_JOBS[job_id]["startedAt"])
+            if int(result["summary"].get("unpricedCandidateCount") or 0) > 0:
+                result["summary"]["pricePendingComplete"] = True
+                result["summary"]["priceProgress"] = {
+                    "stage": "complete-with-pending-price",
+                    "phase": "complete",
+                    "missingHotelCount": int(result["summary"].get("unpricedCandidateCount") or 0),
+                    "totalHotels": int(result["summary"].get("candidateCount") or len(result.get("allHotels") or []) or 0),
+                }
             remember_search_result(key, provider_name, result)
             record_hot_search(payload)
             with SEARCH_JOB_LOCK:
