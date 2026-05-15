@@ -101,6 +101,9 @@ def test_export_pdf_html_includes_all_hotel_sections():
     assert "全部附近星级候选酒店" in html
     assert "高价高优惠酒店" in html
     assert "低价酒店" in html
+    assert "排序说明" in html
+    assert "按距离由近到远排序" in html
+    assert "<th>点评</th>" not in html
 
 
 def test_export_pdf_html_defaults_to_distance_order():

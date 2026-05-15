@@ -215,11 +215,10 @@ def export_hotel_table(hotels: list[dict[str, Any]], *, title: str, empty_text: 
             f"<td>{html_escape(export_money(hotel.get('referencePrice') or hotel.get('averageComparePrice')))}</td>"
             f"<td class=\"delta {delta_class}\">{html_escape(delta_text)}</td>"
             f"<td>{html_escape(export_number(hotel.get('rating'), '分', 1))}</td>"
-            f"<td>{html_escape(export_number(hotel.get('reviewCount'), '', 0))}</td>"
             f"<td>{trip_link}</td>"
             "</tr>"
         )
-    body = "\n".join(rows) if rows else f"<tr><td colspan=\"11\" class=\"empty\">{html_escape(empty_text)}</td></tr>"
+    body = "\n".join(rows) if rows else f"<tr><td colspan=\"10\" class=\"empty\">{html_escape(empty_text)}</td></tr>"
     return f"""
       <section class="pdf-section">
         <h2>{html_escape(title)} <small>{len(hotels)} 家</small></h2>
@@ -235,7 +234,6 @@ def export_hotel_table(hotels: list[dict[str, Any]], *, title: str, empty_text: 
               <th>参考价</th>
               <th>价格差</th>
               <th>评分</th>
-              <th>点评</th>
               <th>链接</th>
             </tr>
           </thead>
@@ -328,6 +326,7 @@ def build_search_result_pdf_html(result: dict[str, Any]) -> str:
   <header>
     <h1>星级酒店捡漏雷达搜索记录</h1>
     <p class="caption">导出时间：{html_escape(generated_at)}｜数据源：{html_escape(provider)}｜价格为 Trip.com 已返回的含税价/参考价。</p>
+    <p class="caption sort-note">排序说明：PDF 中各酒店列表默认按距离由近到远排序；没有距离信息的酒店排在后面。</p>
     {holiday_note}
     <div class="meta">
       <div><span>目标城市</span><strong>{html_escape(city)}</strong></div>
