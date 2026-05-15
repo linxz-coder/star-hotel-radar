@@ -704,6 +704,21 @@ select:focus {
   font-weight: 820;
 }
 
+.deal-badge--positive {
+  background: #dff6ed;
+  color: #08704f;
+}
+
+.deal-badge--negative {
+  background: #ffe7e2;
+  color: var(--red);
+}
+
+.deal-badge--neutral {
+  background: #eef2f7;
+  color: #475569;
+}
+
 .hotel-meta {
   margin-top: 7px;
   color: var(--muted);
@@ -781,13 +796,57 @@ select:focus {
   word-break: keep-all;
 }
 
-.price-cell.discount {
-  background: #f7fbf9;
-  border-color: #cfebe4;
+.price-cell.price-delta {
+  position: relative;
+  overflow: hidden;
 }
 
-.price-cell.discount strong {
-  color: var(--teal);
+.price-cell.price-delta::before {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 3px;
+}
+
+.price-cell.price-delta--positive {
+  background: #f2fbf7;
+  border-color: #bdebd9;
+}
+
+.price-cell.price-delta--positive::before {
+  background: #0b8f63;
+}
+
+.price-cell.price-delta--positive span,
+.price-cell.price-delta--positive strong {
+  color: #08704f;
+}
+
+.price-cell.price-delta--negative {
+  background: #fff5f3;
+  border-color: #fec7bd;
+}
+
+.price-cell.price-delta--negative::before {
+  background: var(--red);
+}
+
+.price-cell.price-delta--negative span,
+.price-cell.price-delta--negative strong {
+  color: var(--red);
+}
+
+.price-cell.price-delta--neutral {
+  background: #f8fafc;
+  border-color: #d8e2ee;
+}
+
+.price-cell.price-delta--neutral::before {
+  background: #94a3b8;
+}
+
+.price-cell.price-delta--neutral strong {
+  color: #475569;
 }
 
 .reason {

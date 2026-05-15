@@ -189,6 +189,46 @@ def test_force_refresh_skips_cached_response_and_merges_into_cache(monkeypatch, 
     assert cached["summary"]["mergedFromCache"] is True
 
 
+def test_cache_merge_preserves_confirmed_price_when_fresh_result_is_pending():
+    app_module = importlib.import_module("app")
+    cached = sample_result("discount")
+    cached["compareDates"] = ["2026-06-01", "2026-06-02"]
+    cached["allHotels"][1].update(
+        {
+            "compareDates": ["2026-06-01", "2026-06-02"],
+            "comparePrices": [500, 800],
+            "currentPrice": 500,
+            "pricePending": False,
+            "isDeal": True,
+            "discountAmount": 150,
+        }
+    )
+    fresh = sample_result("discount")
+    fresh["compareDates"] = ["2026-06-01", "2026-06-02"]
+    fresh["allHotels"] = [
+        {
+            **fresh["allHotels"][1],
+            "compareDates": ["2026-06-01", "2026-06-02"],
+            "comparePrices": [None, None],
+            "currentPrice": None,
+            "pricePending": True,
+            "isDeal": False,
+            "discountAmount": None,
+        }
+    ]
+    fresh["dealHotels"] = []
+    fresh["recommendedHotels"] = list(fresh["allHotels"])
+
+    merged = app_module.merge_search_result_with_cached(fresh, cached)
+    hotel = next(item for item in merged["allHotels"] if item["hotelId"] == "cheap")
+
+    assert hotel["currentPrice"] == 500
+    assert hotel["comparePrices"] == [500, 800]
+    assert hotel["pricePending"] is False
+    assert hotel["priceCarriedFromCache"] is True
+    assert any(item["hotelId"] == "cheap" for item in merged["dealHotels"])
+
+
 def test_search_defaults_to_tripcom_and_passes_target_hint(monkeypatch, tmp_path):
     app_module = importlib.import_module("app")
     monkeypatch.setattr(app_module, "SEARCH_CACHE_DIR", tmp_path)

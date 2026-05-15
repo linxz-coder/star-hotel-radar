@@ -377,6 +377,101 @@ class FakeDiscoveryProvider:
         }
 
 
+class FakeLateDiscoveryProvider(FakeDiscoveryProvider):
+    def get_hotel_prices(self, hotel_ids, dates, progress_callback=None):
+        date = dates[0]
+        if date == "2026-06-08" and not self.cached_hotels:
+            self.cached_hotels.append(
+                {
+                    "hotelId": "late",
+                    "hotelName": "广州珠江新城后发现酒店",
+                    "starRating": 4,
+                    "distanceKm": 2.2,
+                    "currentPrice": 700,
+                    "priceDate": "2026-06-08",
+                }
+            )
+            self.price_cache.setdefault("late", {})["2026-06-08"] = 700
+        late_prices = {
+            "2026-06-01": 500,
+            "2026-06-02": 850,
+            "2026-06-08": 700,
+            "2026-06-09": 950,
+        }
+        for hotel_id in hotel_ids:
+            hotel_id = str(hotel_id)
+            price = late_prices.get(date, 900) if hotel_id == "late" else 900
+            self.price_cache.setdefault(hotel_id, {})[date] = price
+        if progress_callback:
+            progress_callback(
+                {
+                    "phase": "complete",
+                    "date": date,
+                    "dateIndex": 1,
+                    "completedDates": 1,
+                    "totalDates": 1,
+                    "pricedHotelCount": len(hotel_ids),
+                    "missingHotelCount": 0,
+                    "totalHotels": len(hotel_ids),
+                }
+            )
+        return {str(hotel_id): {date: self.price_cache.get(str(hotel_id), {}).get(date)} for hotel_id in hotel_ids}
+
+
+class FakeSaturdaySelectedPriceProvider(FakeUnpricedProvider):
+    def __init__(self):
+        self.price_calls = []
+
+    def get_hotel_prices(self, hotel_ids, dates, progress_callback=None):
+        date = dates[0]
+        self.price_calls.append(date)
+        price = 600 if date == "2026-06-13" else 800
+        if progress_callback:
+            progress_callback(
+                {
+                    "phase": "complete",
+                    "date": date,
+                    "dateIndex": 1,
+                    "completedDates": 1,
+                    "totalDates": 1,
+                    "pricedHotelCount": len(hotel_ids),
+                    "missingHotelCount": 0,
+                    "totalHotels": len(hotel_ids),
+                }
+            )
+        return {str(hotel_id): {date: price} for hotel_id in hotel_ids}
+
+
+class FakeFinalRetryPriceProvider(FakeUnpricedProvider):
+    def __init__(self):
+        self.price_call_counts = {}
+
+    def get_hotel_prices(self, hotel_ids, dates, progress_callback=None):
+        date = dates[0]
+        result = {}
+        for hotel_id in hotel_ids:
+            hotel_id = str(hotel_id)
+            key = (hotel_id, date)
+            self.price_call_counts[key] = self.price_call_counts.get(key, 0) + 1
+            price = 500 if self.price_call_counts[key] >= 2 else None
+            result.setdefault(hotel_id, {})[date] = price
+        if progress_callback:
+            priced_count = sum(1 for prices in result.values() if prices.get(date) not in (None, ""))
+            progress_callback(
+                {
+                    "phase": "complete",
+                    "date": date,
+                    "dateIndex": 1,
+                    "completedDates": 1,
+                    "totalDates": 1,
+                    "pricedHotelCount": priced_count,
+                    "missingHotelCount": len(hotel_ids) - priced_count,
+                    "totalHotels": len(hotel_ids),
+                }
+            )
+        return result
+
+
 class FakeProgressDiscoveryProvider:
     source_name = "Trip.com 测试"
 
@@ -591,10 +686,66 @@ def test_search_deals_adds_candidates_discovered_while_pricing():
     hotels = {hotel["hotelId"]: hotel for hotel in result["allHotels"]}
     assert set(hotels) == {"initial", "discovered"}
     assert hotels["initial"]["currentPrice"] == 500
-    assert hotels["discovered"]["currentPrice"] is None
-    assert hotels["discovered"]["pricePending"] is True
+    assert hotels["discovered"]["currentPrice"] == 900
+    assert hotels["discovered"]["pricePending"] is False
+    assert hotels["discovered"]["comparePrices"][0] == 900
+    assert hotels["discovered"]["comparePrices"][1] == 680
     assert result["summary"]["candidateCount"] == 2
-    assert result["summary"]["unpricedCandidateCount"] == 1
+    assert result["summary"]["unpricedCandidateCount"] == 0
+
+
+def test_search_deals_backfills_previous_compare_dates_for_late_discovered_candidates():
+    result = search_deals(
+        provider=FakeLateDiscoveryProvider(),
+        city="广州",
+        target_hotel_name="广州珠江新城",
+        selected_date="2026-06-01",
+        radius_km=3,
+        min_star=4,
+    )
+
+    hotels = {hotel["hotelId"]: hotel for hotel in result["allHotels"]}
+    assert hotels["late"]["currentPrice"] == 500
+    assert hotels["late"]["comparePrices"] == [500, 850, 700, 950]
+    assert hotels["late"]["pricePending"] is False
+    assert hotels["late"]["isDeal"] is True
+
+
+def test_search_deals_fetches_selected_price_when_selected_date_is_not_compare_date():
+    provider = FakeSaturdaySelectedPriceProvider()
+    result = search_deals(
+        provider=provider,
+        city="广州",
+        target_hotel_name="广州珠江新城",
+        selected_date="2026-06-13",
+        radius_km=3,
+        min_star=4,
+    )
+
+    hotel = result["allHotels"][0]
+    assert result["compareDates"] == ["2026-06-26", "2026-06-27", "2026-07-03", "2026-07-04"]
+    assert "2026-06-13" in provider.price_calls
+    assert hotel["currentPrice"] == 600
+    assert hotel["comparePrices"] == [800, 800, 800, 800]
+    assert hotel["pricePending"] is False
+
+
+def test_search_deals_final_retry_rechecks_pending_prices():
+    provider = FakeFinalRetryPriceProvider()
+    result = search_deals(
+        provider=provider,
+        city="广州",
+        target_hotel_name="广州珠江新城",
+        selected_date="2026-06-01",
+        radius_km=3,
+        min_star=4,
+    )
+
+    hotel = result["allHotels"][0]
+    assert hotel["currentPrice"] == 500
+    assert hotel["comparePrices"] == [500, 500, 500, 500]
+    assert hotel["pricePending"] is False
+    assert provider.price_call_counts[("pending-price", "2026-06-01")] == 2
 
 
 def test_search_deals_publishes_discovered_candidates_during_price_progress():

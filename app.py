@@ -18,6 +18,7 @@ from werkzeug.exceptions import HTTPException
 from hotel_deals import (
     HotelDealError,
     apply_verified_hotel_name_payload,
+    calculateDealScore,
     finalize_pending_hotel_name,
     get_compare_date_info,
     hotel_brand_payload,
@@ -50,7 +51,7 @@ MAX_SEARCH_CACHE_ITEMS = 256
 MAX_HOT_SEARCH_RECORDS = 80
 HOT_SEARCH_TTL_SECONDS = 30 * 24 * 60 * 60
 HOTEL_NAME_CACHE_TTL_SECONDS = int(os.environ.get("HOTEL_DEAL_NAME_CACHE_TTL_SECONDS", str(365 * 24 * 60 * 60)))
-CACHE_LOGIC_VERSION = "search_v34_name_verification"
+CACHE_LOGIC_VERSION = "search_v37_pending_price_detail_backfill"
 MYSQL_SEARCH_CACHE = MySQLSearchCache.from_env()
 MYSQL_HOTEL_NAME_CACHE = MySQLHotelNameCache.from_env()
 HOTEL_NAME_CACHE_LOCK = threading.RLock()
@@ -788,6 +789,79 @@ def hotel_merge_key(hotel: dict[str, Any]) -> str:
     return f"name:{name.casefold()}" if name else ""
 
 
+def value_missing(value: Any) -> bool:
+    return value in (None, "")
+
+
+def merge_compare_prices_with_cached(item: dict[str, Any], cached: dict[str, Any]) -> bool:
+    fresh_dates = [str(date) for date in (item.get("compareDates") or [])]
+    cached_dates = [str(date) for date in (cached.get("compareDates") or [])]
+    fresh_prices = list(item.get("comparePrices") or [])
+    cached_prices = list(cached.get("comparePrices") or [])
+    if not fresh_dates or not cached_dates or not cached_prices:
+        return False
+    cached_by_date = {
+        date: cached_prices[index]
+        for index, date in enumerate(cached_dates)
+        if index < len(cached_prices) and cached_prices[index] not in (None, "")
+    }
+    changed = False
+    merged_prices: list[Any] = []
+    for index, date in enumerate(fresh_dates):
+        price = fresh_prices[index] if index < len(fresh_prices) else None
+        cached_price = cached_by_date.get(date)
+        if value_missing(price) and cached_price not in (None, ""):
+            merged_prices.append(cached_price)
+            changed = True
+        else:
+            merged_prices.append(price)
+    if changed:
+        item["comparePrices"] = merged_prices
+    return changed
+
+
+def refresh_score_after_cached_price_merge(item: dict[str, Any]) -> None:
+    current_price = item.get("currentPrice")
+    compare_prices = item.get("comparePrices") or []
+    if value_missing(current_price) or not isinstance(compare_prices, list):
+        return
+    item.update(calculateDealScore(current_price, compare_prices))
+    item["pricePending"] = False
+
+
+def merge_fresh_hotel_with_cached_price_fields(fresh: dict[str, Any], cached: dict[str, Any]) -> dict[str, Any]:
+    item = copy.deepcopy(fresh)
+    carried_price = False
+    if value_missing(item.get("currentPrice")) and not value_missing(cached.get("currentPrice")):
+        for key in (
+            "currentPrice",
+            "priceIncludesTax",
+            "priceSource",
+            "averageComparePrice",
+            "referencePrice",
+            "referencePriceLabel",
+            "averageDiscountAmount",
+            "maxComparePrice",
+            "maxSingleDayDiscountAmount",
+            "dealBasis",
+            "discountAmount",
+            "discountPercent",
+            "isDeal",
+        ):
+            if key in cached:
+                item[key] = copy.deepcopy(cached.get(key))
+        if value_missing(item.get("tripUrl")) and not value_missing(cached.get("tripUrl")):
+            item["tripUrl"] = cached.get("tripUrl")
+        item["pricePending"] = False
+        carried_price = True
+    if merge_compare_prices_with_cached(item, cached):
+        carried_price = True
+        refresh_score_after_cached_price_merge(item)
+    if carried_price:
+        item["priceCarriedFromCache"] = True
+    return item
+
+
 def merge_hotel_lists_with_fresh_priority(
     fresh_hotels: list[dict[str, Any]],
     cached_hotels: list[dict[str, Any]],
@@ -797,7 +871,8 @@ def merge_hotel_lists_with_fresh_priority(
     fresh_keys: set[str] = set()
     corrected_count = 0
 
-    cached_keys = {hotel_merge_key(hotel) for hotel in cached_hotels if hotel_merge_key(hotel)}
+    cached_by_key = {hotel_merge_key(hotel): hotel for hotel in cached_hotels if hotel_merge_key(hotel)}
+    cached_keys = set(cached_by_key)
     for hotel in fresh_hotels:
         item = copy.deepcopy(hotel)
         key = hotel_merge_key(item)
@@ -805,6 +880,7 @@ def merge_hotel_lists_with_fresh_priority(
             continue
         if key and key in cached_keys:
             corrected_count += 1
+            item = merge_fresh_hotel_with_cached_price_fields(item, cached_by_key[key])
         if key:
             seen.add(key)
             fresh_keys.add(key)
@@ -1398,7 +1474,12 @@ def start_background_search_job(
                     priced = int(progress_info.get("pricedHotelCount") or 0)
                     total_hotels = int(progress_info.get("totalHotels") or 0)
                     missing = int(progress_info.get("missingHotelCount") or 0)
-                    if phase == "start":
+                    backfill_mode = str(progress_info.get("backfillMode") or "")
+                    if backfill_mode == "final" and phase == "detail":
+                        message = f"搜索完成前正在总检查 {date_value} 的待补价酒店，逐家打开 Trip.com 详情页补齐含税价。"
+                    elif backfill_mode == "pending" and phase == "detail":
+                        message = f"正在异步检查 {date_value} 仍待补价的酒店，逐家打开 Trip.com 详情页补齐含税价。"
+                    elif phase == "start":
                         message = f"正在补齐对比日期含税价：{date_value}（第 {date_index}/{total} 个日期），当前已匹配 {priced}/{total_hotels} 家。"
                     elif phase == "list":
                         message = f"{date_value} 列表价已匹配 {priced}/{total_hotels} 家，正在用详情页补齐剩余含税价。"

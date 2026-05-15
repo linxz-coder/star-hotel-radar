@@ -425,6 +425,93 @@ def test_get_hotel_prices_uses_detail_context_for_missing_date(monkeypatch):
     )
 
 
+def test_get_hotel_prices_treats_cached_none_as_still_missing(monkeypatch):
+    provider = TripComProvider()
+    provider._last_target = target_hotel()
+    provider._last_search_targets = [target_hotel()]
+    provider._candidate_cache = {
+        "40365204": {
+            "hotelId": "40365204",
+            "hotelName": "上海待补价酒店",
+            "starRating": 5,
+            "distanceKm": 1.5,
+            "currentPrice": None,
+        }
+    }
+    provider._price_cache = {"40365204": {"2026-06-02": None}}
+    detail_calls: list[str] = []
+
+    monkeypatch.setattr(provider, "_fetch_hotel_list_for_date", lambda *args, **kwargs: [])
+
+    def fake_detail(seed, date_value):
+        detail_calls.append(str(seed.get("hotelId")))
+        return [
+            {
+                **seed,
+                "currentPrice": 888,
+                "priceDate": date_value,
+                "priceIncludesTax": True,
+                "priceSource": "Trip.com detail room total incl. taxes & fees",
+            }
+        ]
+
+    monkeypatch.setattr(provider, "_fetch_hotel_detail_context_for_date", fake_detail)
+
+    prices = provider.get_hotel_prices(["40365204"], ["2026-06-02"])
+
+    assert detail_calls == ["40365204"]
+    assert prices["40365204"]["2026-06-02"] == 888
+    assert provider.get_cached_hotel_prices(["40365204"], ["2026-06-02"])["40365204"]["2026-06-02"] == 888
+
+
+def test_get_hotel_prices_opens_own_detail_when_list_card_has_no_price(monkeypatch):
+    provider = TripComProvider()
+    provider._last_target = target_hotel()
+    provider._last_search_targets = [target_hotel()]
+    provider._candidate_cache = {
+        "40365204": {
+            "hotelId": "40365204",
+            "hotelName": "上海待补价酒店",
+            "starRating": 5,
+            "distanceKm": 1.5,
+            "currentPrice": None,
+        }
+    }
+    provider._price_cache = {}
+    detail_calls: list[str] = []
+
+    def fake_fetch(search_target, date_value, fast_mode=False, deep_mode=False):
+        return [
+            {
+                "hotelId": "40365204",
+                "hotelName": "上海待补价酒店",
+                "starRating": 5,
+                "distanceKm": 1.5,
+                "currentPrice": None,
+            }
+        ]
+
+    def fake_detail(seed, date_value):
+        detail_calls.append(str(seed.get("hotelId")))
+        return [
+            {
+                **seed,
+                "currentPrice": 777,
+                "priceDate": date_value,
+                "priceIncludesTax": True,
+                "priceSource": "Trip.com detail room total incl. taxes & fees",
+            }
+        ]
+
+    monkeypatch.setattr(provider, "_fetch_hotel_list_for_date", fake_fetch)
+    monkeypatch.setattr(provider, "_fetch_hotel_detail_context_for_date", fake_detail)
+
+    prices = provider.get_hotel_prices(["40365204"], ["2026-06-02"])
+
+    assert detail_calls == ["40365204"]
+    assert prices["40365204"]["2026-06-02"] == 777
+
+
 def test_get_hotel_prices_retries_detail_seed_when_seed_price_missing(monkeypatch):
     provider = TripComProvider()
     provider._last_target = target_hotel()

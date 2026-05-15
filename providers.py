@@ -746,10 +746,17 @@ class TripComProvider:
             str(hotel_id): {
                 date: self._price_cache.get(str(hotel_id), {}).get(date)
                 for date in dates
-                if date in self._price_cache.get(str(hotel_id), {})
+                if self._cached_price_available(str(hotel_id), date)
             }
             for hotel_id in hotel_ids
         }
+
+    def _cached_price_available(self, hotel_id: str, date_value: str) -> bool:
+        return self._price_cache.get(str(hotel_id), {}).get(date_value) not in (None, "")
+
+    def _store_price_if_available(self, hotel_id: str, date_value: str, price: Any) -> None:
+        if price not in (None, ""):
+            self._price_cache.setdefault(str(hotel_id), {})[date_value] = price
 
     def _resolved_name_payload_from_sources(
         self,
@@ -879,7 +886,7 @@ class TripComProvider:
                     completed_dates=date_index - 1,
                     phase="start",
                 )
-            date_missing = any(date_value not in self._price_cache.get(str(hotel_id), {}) for hotel_id in hotel_ids)
+            date_missing = any(not self._cached_price_available(str(hotel_id), date_value) for hotel_id in hotel_ids)
             if not date_missing:
                 if progress_callback:
                     self._publish_price_progress(
@@ -907,11 +914,11 @@ class TripComProvider:
                 if not hotel_id:
                     continue
                 self._candidate_cache[hotel_id] = hotel
-                self._price_cache.setdefault(hotel_id, {})[date_value] = hotel.get("currentPrice")
+                self._store_price_if_available(hotel_id, date_value, hotel.get("currentPrice"))
             still_missing = [
                 str(hotel_id)
                 for hotel_id in hotel_ids
-                if date_value not in self._price_cache.get(str(hotel_id), {})
+                if not self._cached_price_available(str(hotel_id), date_value)
             ]
             if progress_callback:
                 self._publish_price_progress(
@@ -940,12 +947,12 @@ class TripComProvider:
                     if not hotel_id:
                         continue
                     self._candidate_cache[hotel_id] = hotel
-                    self._price_cache.setdefault(hotel_id, {})[date_value] = hotel.get("currentPrice")
+                    self._store_price_if_available(hotel_id, date_value, hotel.get("currentPrice"))
 
             still_missing = [
                 str(hotel_id)
                 for hotel_id in hotel_ids
-                if date_value not in self._price_cache.get(str(hotel_id), {})
+                if not self._cached_price_available(str(hotel_id), date_value)
             ]
             if still_missing and self._deep_list_fallback_enabled():
                 if progress_callback:
@@ -972,7 +979,7 @@ class TripComProvider:
                     if not hotel_id:
                         continue
                     self._candidate_cache[hotel_id] = hotel
-                    self._price_cache.setdefault(hotel_id, {})[date_value] = hotel.get("currentPrice")
+                    self._store_price_if_available(hotel_id, date_value, hotel.get("currentPrice"))
 
             if progress_callback:
                 self._publish_price_progress(
@@ -1658,7 +1665,14 @@ class TripComProvider:
         if not hotel_id or not city_id:
             return []
 
-        url = self._detail_v2_url(hotel_id, city_id, checkin_date, checkout_date)
+        urls = list(
+            dict.fromkeys(
+                [
+                    self._detail_url(hotel_id, city_id, checkin_date, checkout_date),
+                    self._detail_v2_url(hotel_id, city_id, checkin_date, checkout_date),
+                ]
+            )
+        )
         detail_items: list[dict[str, Any]] = []
         room_price_seen = False
         nearby_seen = False
@@ -1726,11 +1740,19 @@ Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
                     )
                     page = context.new_page()
                     page.on("response", collect_response_items)
-                    page.goto(url, wait_until="domcontentloaded", timeout=35000)
-                    for _ in range(12):
-                        if room_price_seen and nearby_seen:
+                    for url in urls:
+                        try:
+                            page.goto(url, wait_until="domcontentloaded", timeout=35000)
+                        except PlaywrightTimeoutError:
+                            if url == urls[-1]:
+                                raise
+                            continue
+                        for _ in range(12):
+                            if room_price_seen and nearby_seen:
+                                break
+                            page.wait_for_timeout(800)
+                        if room_price_seen:
                             break
-                        page.wait_for_timeout(800)
                     page.remove_listener("response", collect_response_items)
                     browser.close()
             except PlaywrightTimeoutError as exc:
@@ -1752,6 +1774,9 @@ Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
             "checkout": check_out.strftime("%Y/%m/%d"),
             "curr": "CNY",
             "locale": "zh-CN",
+            "crn": 1,
+            "adult": 2,
+            "children": 0,
         }
         return "https://www.trip.com/hotels/v2/detail/?" + urlencode(params)
 
@@ -2552,6 +2577,9 @@ Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
             "checkout": check_out.strftime("%Y/%m/%d"),
             "curr": "CNY",
             "locale": "zh-CN",
+            "crn": 1,
+            "adult": 2,
+            "children": 0,
         }
         return "https://www.trip.com/hotels/detail/?" + urlencode(params)
 

@@ -607,14 +607,25 @@ def sort_recommended_hotels(hotels: list[dict[str, Any]], sort_by: str) -> list[
     )
 
 
-def hotel_price_for_selected_date(hotel: dict[str, Any], selected_value: str) -> int | float | None:
+def hotel_price_for_date(
+    hotel: dict[str, Any],
+    date_value: str,
+    *,
+    allow_undated: bool = False,
+) -> int | float | None:
     price = hotel.get("currentPrice")
     if price in (None, ""):
         return None
     price_date = str(hotel.get("priceDate") or hotel.get("selectedDate") or "").strip()
-    if price_date and price_date != selected_value:
+    if price_date and price_date != date_value:
+        return None
+    if not price_date and not allow_undated:
         return None
     return price
+
+
+def hotel_price_for_selected_date(hotel: dict[str, Any], selected_value: str) -> int | float | None:
+    return hotel_price_for_date(hotel, selected_value, allow_undated=True)
 
 
 def prefer_hotel_candidate(candidate: dict[str, Any], current: dict[str, Any], selected_value: str) -> bool:
@@ -1361,6 +1372,11 @@ def search_deals(
         if hotel.get("hotelId") and hotel_price_for_selected_date(hotel, selected_value) not in (None, "")
     }
     merge_known_price_cache(provider, price_map, hotel_ids, [selected_value])
+    price_attempted_keys: set[tuple[str, str]] = {
+        (str(hotel_id), selected_value)
+        for hotel_id in hotel_ids
+        if price_map.get(str(hotel_id), {}).get(selected_value) not in (None, "")
+    }
     completed_compare_dates: list[str] = []
     selected_price_known = all(
         price_map.get(str(hotel_id), {}).get(selected_value) not in (None, "")
@@ -1368,10 +1384,9 @@ def search_deals(
     )
     last_price_progress_partial_signature: tuple[int, int, int] | None = None
 
-    def publish_price_progress_candidate_snapshot() -> None:
-        nonlocal nearby_hotels, hotel_ids, last_price_progress_partial_signature
-        if not progress_callback:
-            return
+    def merge_cached_candidate_snapshot() -> list[str]:
+        nonlocal nearby_hotels, hotel_ids
+        previous_ids = set(hotel_ids)
         discovered_hotels = cached_nearby_hotels_from_provider(
             provider,
             target,
@@ -1379,10 +1394,114 @@ def search_deals(
             min_star=min_star,
             selected_value=selected_value,
         )
-        if discovered_hotels:
-            nearby_hotels = merge_nearby_hotels(nearby_hotels, discovered_hotels, selected_value)
-            hotel_ids = [str(hotel["hotelId"]) for hotel in nearby_hotels if hotel.get("hotelId")]
-            merge_known_price_cache(provider, price_map, hotel_ids, [selected_value, *compare_dates])
+        if not discovered_hotels:
+            return []
+        nearby_hotels = merge_nearby_hotels(nearby_hotels, discovered_hotels, selected_value)
+        hotel_ids = [str(hotel["hotelId"]) for hotel in nearby_hotels if hotel.get("hotelId")]
+        merge_known_price_cache(provider, price_map, hotel_ids, [selected_value, *compare_dates])
+        return [hotel_id for hotel_id in hotel_ids if hotel_id not in previous_ids]
+
+    def ordered_price_dates(date_values: list[str]) -> list[str]:
+        requested = {str(date_value) for date_value in date_values if date_value}
+        ordered: list[str] = []
+        if selected_value in requested:
+            ordered.append(selected_value)
+        for compare_date in compare_dates:
+            if compare_date in requested and compare_date not in ordered:
+                ordered.append(compare_date)
+        for date_value in date_values:
+            date_value = str(date_value)
+            if date_value and date_value not in ordered:
+                ordered.append(date_value)
+        return ordered
+
+    def sync_candidate_prices_from_hotels(date_values: list[str]) -> bool:
+        changed = False
+        for hotel in nearby_hotels:
+            hotel_id = str(hotel.get("hotelId") or "")
+            if not hotel_id:
+                continue
+            for date_value in ordered_price_dates(date_values):
+                price = hotel_price_for_date(
+                    hotel,
+                    date_value,
+                    allow_undated=date_value == selected_value,
+                )
+                if price in (None, ""):
+                    continue
+                if price_map.get(hotel_id, {}).get(date_value) in (None, ""):
+                    price_map.setdefault(hotel_id, {})[date_value] = price
+                    changed = True
+        return changed
+
+    def backfill_missing_prices_for_dates(
+        date_values: list[str],
+        *,
+        force_retry: bool = False,
+        backfill_mode: str = "pending",
+    ) -> bool:
+        dates_to_backfill = ordered_price_dates(date_values)
+        if not dates_to_backfill:
+            return False
+        before_prices = {
+            (str(hotel_id), date_value): price_map.get(str(hotel_id), {}).get(date_value)
+            for hotel_id in hotel_ids
+            for date_value in dates_to_backfill
+        }
+        changed = sync_candidate_prices_from_hotels(dates_to_backfill)
+        merge_known_price_cache(provider, price_map, hotel_ids, dates_to_backfill)
+        for date_value in dates_to_backfill:
+            missing_hotel_ids: list[str] = []
+            for hotel_id in hotel_ids:
+                hotel_id = str(hotel_id)
+                if price_map.get(hotel_id, {}).get(date_value) not in (None, ""):
+                    price_attempted_keys.add((hotel_id, date_value))
+                    continue
+                attempt_key = (hotel_id, date_value)
+                if attempt_key in price_attempted_keys and not force_retry:
+                    continue
+                price_attempted_keys.add(attempt_key)
+                missing_hotel_ids.append(hotel_id)
+            if not missing_hotel_ids:
+                continue
+
+            def publish_backfill_price_progress(progress_info: dict[str, Any]) -> None:
+                phase = str(progress_info.get("phase") or "")
+                normalized = dict(progress_info)
+                normalized["backfillMode"] = backfill_mode
+                normalized["totalExpectedPriceCount"] = len(hotel_ids) * len(dates_to_backfill)
+                if price_progress_callback:
+                    price_progress_callback(normalized)
+                if phase in {"list", "detail", "deep", "complete"}:
+                    publish_price_progress_candidate_snapshot()
+
+            try:
+                date_prices = getHotelPrices(
+                    provider,
+                    missing_hotel_ids,
+                    [date_value],
+                    progressCallback=publish_backfill_price_progress if (price_progress_callback or progress_callback) else None,
+                )
+            except Exception:
+                continue
+            for hotel_id, prices in date_prices.items():
+                price = prices.get(date_value) if isinstance(prices, dict) else None
+                if price not in (None, ""):
+                    price_map.setdefault(str(hotel_id), {})[date_value] = price
+            merge_cached_candidate_snapshot()
+            changed = sync_candidate_prices_from_hotels(dates_to_backfill) or changed
+            merge_known_price_cache(provider, price_map, hotel_ids, dates_to_backfill)
+        return changed or any(
+            before_prices.get((str(hotel_id), date_value)) != price_map.get(str(hotel_id), {}).get(date_value)
+            for hotel_id in hotel_ids
+            for date_value in dates_to_backfill
+        )
+
+    def publish_price_progress_candidate_snapshot() -> None:
+        nonlocal nearby_hotels, hotel_ids, last_price_progress_partial_signature
+        if not progress_callback:
+            return
+        merge_cached_candidate_snapshot()
         partial_result = search_result_from_price_map(
             provider,
             city=city,
@@ -1436,7 +1555,11 @@ def search_deals(
                 }
             )
 
-    fetched_compare_dates: set[str] = {selected_value} if selected_price_known else set()
+    if selected_value not in compare_dates:
+        backfill_missing_prices_for_dates([selected_value])
+
+    selected_date_price_checked = selected_price_known or selected_value not in compare_dates
+    fetched_compare_dates: set[str] = {selected_value} if selected_date_price_checked else set()
     for compare_date in compare_dates:
         if compare_date in fetched_compare_dates:
             continue
@@ -1461,26 +1584,19 @@ def search_deals(
             if phase in {"list", "detail", "deep", "complete"}:
                 publish_price_progress_candidate_snapshot()
 
+        requested_hotel_ids = list(hotel_ids)
         date_prices = getHotelPrices(
             provider,
-            hotel_ids,
+            requested_hotel_ids,
             [compare_date],
             progressCallback=publish_date_price_progress,
         )
+        price_attempted_keys.update((str(hotel_id), compare_date) for hotel_id in requested_hotel_ids)
         for hotel_id, prices in date_prices.items():
             if compare_date in prices:
                 price_map.setdefault(str(hotel_id), {})[compare_date] = prices.get(compare_date)
-        discovered_hotels = cached_nearby_hotels_from_provider(
-            provider,
-            target,
-            radius_km=max_radius_km,
-            min_star=min_star,
-            selected_value=selected_value,
-        )
-        if discovered_hotels:
-            nearby_hotels = merge_nearby_hotels(nearby_hotels, discovered_hotels, selected_value)
-            hotel_ids = [str(hotel["hotelId"]) for hotel in nearby_hotels if hotel.get("hotelId")]
-            merge_known_price_cache(provider, price_map, hotel_ids, [selected_value, *compare_dates])
+        merge_cached_candidate_snapshot()
+        backfill_changed = backfill_missing_prices_for_dates(list(fetched_compare_dates))
         completed_compare_dates.append(compare_date)
         if progress_callback:
             progress_callback(
@@ -1505,6 +1621,10 @@ def search_deals(
                     completed_compare_dates=completed_compare_dates,
                 )
             )
+            if backfill_changed:
+                publish_price_progress_candidate_snapshot()
+
+    backfill_missing_prices_for_dates([selected_value, *compare_dates], force_retry=True, backfill_mode="final")
 
     return search_result_from_price_map(
         provider,

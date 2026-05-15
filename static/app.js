@@ -191,21 +191,32 @@ function nameVerificationBar(hotel) {
   `;
 }
 
+function priceDeltaTone(discountValue, hasDiscount) {
+  if (!hasDiscount || !Number.isFinite(discountValue)) return "neutral";
+  if (discountValue > 0) return "positive";
+  if (discountValue < 0) return "negative";
+  return "neutral";
+}
+
 function hotelCard(hotel, mode) {
+  const hasDiscount = hotel.discountAmount !== null && hotel.discountAmount !== undefined && hotel.discountAmount !== "";
+  const discountValue = Number(hotel.discountAmount || 0);
+  const deltaTone = priceDeltaTone(discountValue, hasDiscount);
   const badgeText = mode === "deal"
     ? `便宜 ${currency(hotel.discountAmount)}`
     : escapeHtml(hotel.pricePending ? "待补价" : (hotel.brandLabel || hotel.brand || "连锁品牌"));
+  const badgeClass = mode === "deal" ? `deal-badge deal-badge--${deltaTone}` : "deal-badge";
   const hotelName = displayHotelName(hotel);
   const referenceLabel = hotel.referencePriceLabel || "平时参考价";
   const referencePrice = hotel.referencePrice ?? hotel.averageComparePrice;
-  const hasDiscount = hotel.discountAmount !== null && hotel.discountAmount !== undefined && hotel.discountAmount !== "";
   const hasPercent = hotel.discountPercent !== null && hotel.discountPercent !== undefined && hotel.discountPercent !== "";
-  const discountValue = Number(hotel.discountAmount || 0);
   const percentValue = Number(hotel.discountPercent || 0);
-  const discountLabel = discountValue < 0
-    ? "比参考价高"
-    : (hotel.dealBasis === "single_day" ? "较高对比日便宜" : "比平时便宜");
-  const percentLabel = discountValue < 0 ? "高出比例" : "优惠力度";
+  const discountLabel = deltaTone === "negative"
+    ? "比平时高"
+    : (deltaTone === "positive"
+      ? (hotel.dealBasis === "single_day" ? "较高对比日便宜" : "比平时便宜")
+      : "与平时持平");
+  const percentLabel = deltaTone === "negative" ? "高出比例" : (deltaTone === "positive" ? "优惠力度" : "变化比例");
   if (!hotelName) return "";
   return `
     <article class="hotel-card">
@@ -213,7 +224,7 @@ function hotelCard(hotel, mode) {
       <div class="hotel-body">
         <div class="hotel-title-row">
           <h3>${escapeHtml(hotelName)}</h3>
-          <span class="deal-badge">${badgeText}</span>
+          <span class="${badgeClass}">${badgeText}</span>
         </div>
         <div class="hotel-meta">${hotelMeta(hotel)}</div>
         ${nameVerificationBar(hotel)}
@@ -226,11 +237,11 @@ function hotelCard(hotel, mode) {
             <span>${escapeHtml(referenceLabel)}</span>
             <strong>${currency(referencePrice)}</strong>
           </div>
-          <div class="price-cell discount">
+          <div class="price-cell price-delta price-delta--${deltaTone}">
             <span>${escapeHtml(discountLabel)}</span>
             <strong>${hasDiscount ? currency(Math.abs(discountValue)) : "-"}</strong>
           </div>
-          <div class="price-cell discount">
+          <div class="price-cell price-delta price-delta--${deltaTone}">
             <span>${escapeHtml(percentLabel)}</span>
             <strong>${hasPercent ? percent(Math.abs(percentValue)) : "-"}</strong>
           </div>
