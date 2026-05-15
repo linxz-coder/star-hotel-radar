@@ -1039,3 +1039,105 @@ def test_search_cache_prefers_mysql_after_memory_clear(monkeypatch, tmp_path):
     assert second["summary"]["cacheSource"] == "mysql"
     assert second["query"]["sortBy"] == "price"
     assert app_module.TRIPCOM_CACHE_TTL_SECONDS == 7 * 24 * 60 * 60
+
+
+def test_admin_status_reports_running_and_completed_jobs(monkeypatch, tmp_path):
+    app_module = importlib.import_module("app")
+    monkeypatch.setattr(app_module, "SEARCH_CACHE_DIR", tmp_path / "search_cache")
+    app_module.SEARCH_CACHE.clear()
+    app_module.SEARCH_ACTIVITY.clear()
+    with app_module.SEARCH_JOB_LOCK:
+        app_module.SEARCH_JOBS.clear()
+
+    now = time.time()
+    payload = {
+        "city": "广州",
+        "targetHotel": "珠江新城",
+        "selectedDate": "2026-06-19",
+        "radiusKm": "5",
+        "minStar": "4",
+    }
+    running_result = sample_result("discount")
+    running_result["summary"].update(
+        {
+            "candidateCount": 2,
+            "pricedHotelCount": 1,
+            "unpricedCandidateCount": 1,
+            "completedCompareDateCount": 2,
+            "totalCompareDateCount": 4,
+            "nameVerificationActive": True,
+            "nameVerificationTotal": 2,
+            "nameVerificationResolvedCount": 1,
+            "priceProgress": {"date": "2026-06-19", "pricedHotelCount": 1, "totalHotels": 2},
+        }
+    )
+    complete_result = sample_result("distance")
+    complete_result["summary"].update(
+        {
+            "candidateCount": 2,
+            "pricedHotelCount": 2,
+            "unpricedCandidateCount": 0,
+            "dealCount": 2,
+            "recommendedCount": 2,
+        }
+    )
+
+    with app_module.SEARCH_JOB_LOCK:
+        app_module.SEARCH_JOBS["job-running"] = {
+            "id": "job-running",
+            "status": "running",
+            "provider": "tripcom",
+            "payload": payload,
+            "effectivePayload": payload,
+            "startedAt": now - 30,
+            "partialResult": running_result,
+            "progress": app_module.job_progress("name-verification", "正在继续核验酒店中文名", now - 30),
+        }
+        app_module.SEARCH_JOBS["job-complete"] = {
+            "id": "job-complete",
+            "status": "complete",
+            "provider": "tripcom",
+            "payload": payload,
+            "effectivePayload": payload,
+            "startedAt": now - 90,
+            "finishedAt": now - 10,
+            "elapsedMs": 80000,
+            "result": complete_result,
+            "progress": app_module.job_progress("complete", "完整比价已完成。", now - 90),
+        }
+    app_module.record_search_activity("job-started", payload, status="running", job_id="job-running", result=running_result)
+
+    with app_module.app.test_client() as client:
+        response = client.get("/api/admin/status")
+
+    data = response.get_json()
+    assert response.status_code == 200
+    assert data["metrics"]["runningJobs"] == 1
+    assert data["metrics"]["completedJobs"] == 1
+    assert data["metrics"]["nameVerificationJobs"] == 1
+    assert data["metrics"]["unpricedActiveHotels"] == 1
+    assert data["activeJobs"][0]["taskLabel"] == "核验中文名"
+    assert data["activeJobs"][0]["summary"]["priceProgress"]["date"] == "2026-06-19"
+    assert data["completedJobs"][0]["status"] == "complete"
+    assert data["activities"][0]["event"] == "job-started"
+
+
+def test_admin_status_respects_optional_token(monkeypatch, tmp_path):
+    app_module = importlib.import_module("app")
+    monkeypatch.setattr(app_module, "SEARCH_CACHE_DIR", tmp_path / "search_cache")
+    monkeypatch.setenv("HOTEL_DEAL_ADMIN_TOKEN", "secret")
+    with app_module.SEARCH_JOB_LOCK:
+        app_module.SEARCH_JOBS.clear()
+    app_module.SEARCH_ACTIVITY.clear()
+
+    with app_module.app.test_client() as client:
+        denied_api = client.get("/api/admin/status")
+        allowed_api = client.get("/api/admin/status?token=secret")
+        denied_page = client.get("/admin")
+        allowed_page = client.get("/admin?token=secret")
+
+    assert denied_api.status_code == 401
+    assert allowed_api.status_code == 200
+    assert denied_page.status_code == 401
+    assert allowed_page.status_code == 200
+    assert "星级酒店捡漏雷达后台" in allowed_page.get_data(as_text=True)

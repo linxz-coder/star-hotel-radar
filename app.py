@@ -42,6 +42,8 @@ LOCAL_PROVIDER = LocalJsonProvider(APP_DIR)
 SEARCH_CACHE: dict[str, tuple[float, dict[str, Any], float]] = {}
 SEARCH_JOBS: dict[str, dict[str, Any]] = {}
 SEARCH_JOB_LOCK = threading.Lock()
+SEARCH_ACTIVITY: list[dict[str, Any]] = []
+SEARCH_ACTIVITY_LOCK = threading.Lock()
 SEARCH_CACHE_DIR = APP_DIR / ".cache" / "search_cache"
 HOTEL_NAME_CACHE_PATH = APP_DIR / ".cache" / "hotel_name_cache.json"
 HOT_SEARCH_PATH = APP_DIR / ".cache" / "hot_searches.json"
@@ -51,6 +53,7 @@ TRIPCOM_REFRESH_AFTER_SECONDS = int(os.environ.get("HOTEL_DEAL_TRIPCOM_REFRESH_A
 CACHE_RETRY_DELAY_SECONDS = int(os.environ.get("HOTEL_DEAL_SEARCH_RETRY_DELAY_SECONDS", "60"))
 MAX_SEARCH_CACHE_ITEMS = 256
 MAX_HOT_SEARCH_RECORDS = 80
+MAX_SEARCH_ACTIVITY_ITEMS = 200
 HOT_SEARCH_TTL_SECONDS = 30 * 24 * 60 * 60
 HOTEL_NAME_CACHE_TTL_SECONDS = int(os.environ.get("HOTEL_DEAL_NAME_CACHE_TTL_SECONDS", str(365 * 24 * 60 * 60)))
 CACHE_LOGIC_VERSION = "search_v38_city_id_price_progress"
@@ -1555,6 +1558,75 @@ def final_search_progress(result: dict[str, Any], started_at: float | None = Non
     return job_progress("complete", "完整比价已完成。", started_at)
 
 
+def timestamp_iso(value: Any = None) -> str:
+    try:
+        timestamp = float(value if value is not None else time.time())
+    except (TypeError, ValueError):
+        timestamp = time.time()
+    return dt.datetime.fromtimestamp(timestamp).isoformat(timespec="seconds")
+
+
+def compact_search_query(payload: dict[str, Any] | None, result: dict[str, Any] | None = None) -> dict[str, Any]:
+    payload = payload if isinstance(payload, dict) else {}
+    result_query = result.get("query") if isinstance(result, dict) and isinstance(result.get("query"), dict) else {}
+    return {
+        "city": str(payload.get("city") or result_query.get("city") or "").strip(),
+        "targetHotel": str(payload.get("targetHotel") or payload.get("hotel") or result_query.get("targetHotel") or "").strip(),
+        "selectedDate": str(payload.get("selectedDate") or payload.get("checkIn") or result_query.get("selectedDate") or "").strip(),
+        "radiusKm": str(payload.get("radiusKm") or result_query.get("radiusKm") or "").strip(),
+        "minStar": str(payload.get("minStar") or result_query.get("minStar") or "").strip(),
+        "minPrice": str(payload.get("minPrice") or result_query.get("minPrice") or "").strip(),
+        "maxPrice": str(payload.get("maxPrice") or result_query.get("maxPrice") or "").strip(),
+        "forceRefresh": force_refresh_requested(payload) if payload else False,
+    }
+
+
+def compact_result_summary(result: dict[str, Any] | None) -> dict[str, Any]:
+    summary = result.get("summary") if isinstance(result, dict) and isinstance(result.get("summary"), dict) else {}
+    return {
+        "candidateCount": int(summary.get("candidateCount") or 0),
+        "pricedHotelCount": int(summary.get("pricedHotelCount") or 0),
+        "unpricedCandidateCount": int(summary.get("unpricedCandidateCount") or 0),
+        "dealCount": int(summary.get("dealCount") or 0),
+        "recommendedCount": int(summary.get("recommendedCount") or 0),
+        "completedCompareDateCount": int(summary.get("completedCompareDateCount") or 0),
+        "totalCompareDateCount": int(summary.get("totalCompareDateCount") or 0),
+        "nameVerificationActive": bool(summary.get("nameVerificationActive")),
+        "nameVerificationTotal": int(summary.get("nameVerificationTotal") or 0),
+        "nameVerificationResolvedCount": int(summary.get("nameVerificationResolvedCount") or 0),
+        "nameVerificationRemainingCount": int(summary.get("nameVerificationRemainingCount") or 0),
+        "cacheHit": bool(summary.get("cacheHit")),
+        "cacheSource": summary.get("cacheSource") or "",
+        "source": summary.get("source") or "",
+    }
+
+
+def record_search_activity(
+    event: str,
+    payload: dict[str, Any] | None,
+    *,
+    status: str,
+    job_id: str = "",
+    result: dict[str, Any] | None = None,
+    error: str = "",
+) -> None:
+    now = time.time()
+    record = {
+        "event": event,
+        "status": status,
+        "jobId": job_id,
+        "query": compact_search_query(payload, result),
+        "summary": compact_result_summary(result),
+        "error": error,
+        "createdAt": now,
+        "updatedAt": now,
+        "createdAtText": timestamp_iso(now),
+    }
+    with SEARCH_ACTIVITY_LOCK:
+        SEARCH_ACTIVITY.insert(0, record)
+        del SEARCH_ACTIVITY[MAX_SEARCH_ACTIVITY_ITEMS:]
+
+
 def update_search_job(job_id: str, **updates: Any) -> None:
     with SEARCH_JOB_LOCK:
         job = SEARCH_JOBS.get(job_id)
@@ -1654,6 +1726,7 @@ def start_background_search_job(
                 started_at,
             ),
         }
+    record_search_activity("job-started", effective_payload, status="running", job_id=job_id)
 
     def worker() -> None:
         try:
@@ -1894,6 +1967,7 @@ def start_background_search_job(
                 }
             remember_search_result(key, provider_name, result)
             record_hot_search(payload)
+            record_search_activity("job-complete", effective_payload, status="complete", job_id=job_id, result=result)
             with SEARCH_JOB_LOCK:
                 SEARCH_JOBS[job_id].update(
                     {
@@ -1975,6 +2049,7 @@ def start_background_search_job(
                         "progress": progress,
                     }
                 )
+            record_search_activity("job-error", effective_payload, status="error", job_id=job_id, result=partial_result if isinstance(partial_result, dict) else None, error=str(exc))
 
     threading.Thread(target=worker, name=f"hotel-search-{job_id}", daemon=True).start()
     return job_id
@@ -2055,6 +2130,316 @@ def search_job_snapshot(job_id: str, sort_by: str) -> tuple[dict[str, Any], int]
     if not job:
         return {"status": "missing", "error": "搜索任务不存在或已过期"}, 404
     return search_job_payload(job_id, job, sort_by)
+
+
+def configured_admin_token() -> str:
+    return os.environ.get("HOTEL_DEAL_ADMIN_TOKEN", "").strip()
+
+
+def admin_request_authorized() -> bool:
+    token = configured_admin_token()
+    if not token:
+        return True
+    supplied = (request.args.get("token") or request.headers.get("X-Admin-Token") or "").strip()
+    return supplied == token
+
+
+def safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def clamp_percent(value: float) -> int:
+    return max(0, min(100, int(round(value))))
+
+
+def disk_search_cache_count() -> int:
+    try:
+        return len(list(SEARCH_CACHE_DIR.glob("*.json")))
+    except OSError:
+        return 0
+
+
+def admin_progress_percent(status: str, summary: dict[str, Any], progress: dict[str, Any]) -> int:
+    if status in {"complete", "error"}:
+        return 100
+    stage = str(progress.get("stage") or "")
+    if stage in {"queued", ""}:
+        return 5
+    if stage == "waiting-retry":
+        return 40
+    if stage in {"current-price", "first-screen"}:
+        return 20 if safe_int(summary.get("candidateCount")) <= 0 else 30
+    if stage in {"deep-current-price", "partial-deals", "compare-price"}:
+        total_dates = safe_int(summary.get("totalCompareDateCount"))
+        completed_dates = safe_int(summary.get("completedCompareDateCount"))
+        price_progress = summary.get("priceProgress") if isinstance(summary.get("priceProgress"), dict) else {}
+        if price_progress:
+            total_dates = max(total_dates, safe_int(price_progress.get("totalDates")))
+            completed_dates = max(completed_dates, safe_int(price_progress.get("completedDates")))
+        if total_dates > 0:
+            return clamp_percent(35 + (completed_dates / total_dates) * 45)
+        return 45 if safe_int(summary.get("candidateCount")) else 30
+    if stage == "name-verification" or summary.get("nameVerificationActive"):
+        total_names = safe_int(summary.get("nameVerificationTotal"))
+        resolved_names = safe_int(summary.get("nameVerificationResolvedCount"))
+        if total_names > 0:
+            return clamp_percent(85 + (resolved_names / total_names) * 12)
+        return 88
+    if stage in {"complete", "complete-with-pending-price"}:
+        return 100
+    return 25 if safe_int(summary.get("candidateCount")) else 10
+
+
+def admin_task_label(status: str, summary: dict[str, Any], progress: dict[str, Any]) -> str:
+    stage = str(progress.get("stage") or "")
+    if status == "complete":
+        if safe_int(summary.get("unpricedCandidateCount")) > 0:
+            return "已完成，仍有待补价酒店"
+        return "已完成"
+    if status == "error":
+        return "搜索失败"
+    if stage == "waiting-retry":
+        return "等待自动续搜"
+    if stage == "name-verification" or summary.get("nameVerificationActive"):
+        return "核验中文名"
+    if stage in {"compare-price", "partial-deals"}:
+        return "补齐含税价和比价"
+    if stage in {"current-price", "first-screen", "deep-current-price"}:
+        return "搜索附近星级酒店"
+    if stage == "refresh":
+        return "缓存秒出，后台刷新"
+    if stage == "queued":
+        return "排队连接 Trip.com"
+    return "运行中"
+
+
+def admin_job_item(job_id: str, job: dict[str, Any]) -> dict[str, Any]:
+    result = job.get("result") if isinstance(job.get("result"), dict) else job.get("partialResult")
+    result = result if isinstance(result, dict) else {}
+    result_summary = result.get("summary") if isinstance(result.get("summary"), dict) else {}
+    summary = compact_result_summary(result)
+    progress = copy.deepcopy(job.get("progress") or result_summary.get("progress") or {})
+    if not isinstance(progress, dict):
+        progress = {}
+    status = str(job.get("status") or result_summary.get("jobStatus") or "running")
+    started_at = safe_float(job.get("startedAt") or 0)
+    updated_at = safe_float(
+        job.get("finishedAt")
+        or progress.get("updatedAt")
+        or job.get("startedAt")
+        or time.time()
+    )
+    elapsed_ms = safe_float(job.get("elapsedMs") or progress.get("elapsedMs") or 0)
+    if elapsed_ms <= 0 and started_at:
+        elapsed_ms = max(0, round((time.time() - started_at) * 1000, 1))
+    if result_summary.get("priceProgress"):
+        summary["priceProgress"] = result_summary.get("priceProgress")
+    progress_percent = admin_progress_percent(status, summary, progress)
+    return {
+        "jobId": job_id,
+        "status": status,
+        "provider": job.get("provider") or "",
+        "query": compact_search_query(job.get("effectivePayload") or job.get("payload"), result),
+        "summary": summary,
+        "progress": progress,
+        "progressPercent": progress_percent,
+        "taskLabel": admin_task_label(status, summary, progress),
+        "startedAt": started_at or None,
+        "startedAtText": timestamp_iso(started_at) if started_at else "",
+        "updatedAt": updated_at,
+        "updatedAtText": timestamp_iso(updated_at),
+        "finishedAt": job.get("finishedAt") or None,
+        "elapsedMs": elapsed_ms,
+        "error": job.get("error") or job.get("lastError") or "",
+    }
+
+
+def admin_activity_item(activity: dict[str, Any]) -> dict[str, Any]:
+    created_at = safe_float(activity.get("createdAt") or activity.get("updatedAt") or time.time())
+    status = str(activity.get("status") or "complete")
+    return {
+        "jobId": activity.get("jobId") or "",
+        "status": status,
+        "provider": "",
+        "query": activity.get("query") if isinstance(activity.get("query"), dict) else {},
+        "summary": activity.get("summary") if isinstance(activity.get("summary"), dict) else {},
+        "progress": {},
+        "progressPercent": 100,
+        "taskLabel": "缓存命中" if status == "cache-hit" else "已完成",
+        "startedAt": created_at,
+        "startedAtText": timestamp_iso(created_at),
+        "updatedAt": created_at,
+        "updatedAtText": activity.get("createdAtText") or timestamp_iso(created_at),
+        "finishedAt": created_at,
+        "elapsedMs": 0,
+        "error": activity.get("error") or "",
+    }
+
+
+def recent_disk_cache_items(limit: int = 12) -> list[dict[str, Any]]:
+    try:
+        paths = sorted(SEARCH_CACHE_DIR.glob("*.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+    except OSError:
+        return []
+    items: list[dict[str, Any]] = []
+    for path in paths[: max(limit * 3, limit)]:
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        result = record.get("result") if isinstance(record.get("result"), dict) else {}
+        if not result:
+            continue
+        updated_at = safe_float(record.get("updatedAt") or record.get("createdAt") or path.stat().st_mtime)
+        items.append(
+            {
+                "jobId": f"cache:{path.stem[:10]}",
+                "status": "cache-hit",
+                "provider": record.get("provider") or "",
+                "query": compact_search_query({}, result),
+                "summary": compact_result_summary(result),
+                "progress": {},
+                "progressPercent": 100,
+                "taskLabel": "缓存记录",
+                "startedAt": updated_at,
+                "startedAtText": timestamp_iso(updated_at),
+                "updatedAt": updated_at,
+                "updatedAtText": timestamp_iso(updated_at),
+                "finishedAt": updated_at,
+                "elapsedMs": 0,
+                "error": "",
+            }
+        )
+        if len(items) >= limit:
+            break
+    return items
+
+
+def dedupe_admin_items(items: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in sorted(items, key=lambda value: safe_float(value.get("updatedAt")), reverse=True):
+        query = item.get("query") if isinstance(item.get("query"), dict) else {}
+        key = "|".join(
+            [
+                str(query.get("city") or ""),
+                str(query.get("targetHotel") or ""),
+                str(query.get("selectedDate") or ""),
+            ]
+        ) or str(item.get("jobId") or item.get("status") or id(item))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+        if len(deduped) >= limit:
+            break
+    return deduped
+
+
+def admin_status_payload() -> dict[str, Any]:
+    with SEARCH_JOB_LOCK:
+        jobs = copy.deepcopy(SEARCH_JOBS)
+    job_items = [admin_job_item(job_id, job) for job_id, job in jobs.items()]
+    job_items.sort(key=lambda item: safe_float(item.get("updatedAt")), reverse=True)
+    active_jobs = [item for item in job_items if item["status"] == "running"]
+    completed_jobs = [item for item in job_items if item["status"] == "complete"][:20]
+    failed_jobs = [item for item in job_items if item["status"] == "error"][:20]
+    queued_jobs = [
+        item
+        for item in active_jobs
+        if str((item.get("progress") or {}).get("stage") or "") == "queued"
+    ]
+    name_tasks = [
+        item
+        for item in active_jobs
+        if item.get("summary", {}).get("nameVerificationActive")
+        or str((item.get("progress") or {}).get("stage") or "") == "name-verification"
+    ]
+    unpriced_active = sum(
+        safe_int(item.get("summary", {}).get("unpricedCandidateCount"))
+        for item in active_jobs
+    )
+    busy_score = clamp_percent(
+        len(active_jobs) * 35
+        + len(queued_jobs) * 10
+        + len(name_tasks) * 8
+        + min(unpriced_active, 20)
+    )
+    if busy_score >= 80:
+        busy_label = "很忙"
+    elif busy_score >= 45:
+        busy_label = "繁忙"
+    elif busy_score > 0:
+        busy_label = "正常运行"
+    else:
+        busy_label = "空闲"
+    with SEARCH_ACTIVITY_LOCK:
+        activities = copy.deepcopy(SEARCH_ACTIVITY[:80])
+    activity_completed = [
+        admin_activity_item(activity)
+        for activity in activities
+        if activity.get("event") in {"cache-hit", "sync-complete"}
+        or (activity.get("event") == "job-complete" and not activity.get("jobId"))
+    ]
+    completed_jobs = dedupe_admin_items(
+        [*completed_jobs, *activity_completed, *recent_disk_cache_items(limit=12)],
+        20,
+    )
+    mysql_status = {
+        "searchCacheEnabled": MYSQL_SEARCH_CACHE is not None and bool(getattr(MYSQL_SEARCH_CACHE, "enabled", False)),
+        "hotelNameCacheEnabled": MYSQL_HOTEL_NAME_CACHE is not None
+        and bool(getattr(MYSQL_HOTEL_NAME_CACHE, "enabled", False)),
+        "searchCacheLastError": getattr(MYSQL_SEARCH_CACHE, "last_error", "") if MYSQL_SEARCH_CACHE else "",
+        "hotelNameCacheLastError": getattr(MYSQL_HOTEL_NAME_CACHE, "last_error", "") if MYSQL_HOTEL_NAME_CACHE else "",
+    }
+    return {
+        "generatedAt": timestamp_iso(),
+        "busy": {"score": busy_score, "label": busy_label},
+        "metrics": {
+            "runningJobs": len(active_jobs),
+            "queuedJobs": len(queued_jobs),
+            "completedJobs": len(completed_jobs),
+            "errorJobs": len([item for item in job_items if item["status"] == "error"]),
+            "memoryCacheItems": len(SEARCH_CACHE),
+            "diskCacheItems": disk_search_cache_count(),
+            "activityItems": len(activities),
+            "nameVerificationJobs": len(name_tasks),
+            "unpricedActiveHotels": unpriced_active,
+        },
+        "cache": mysql_status,
+        "activeJobs": active_jobs,
+        "completedJobs": completed_jobs,
+        "failedJobs": failed_jobs,
+        "activities": activities,
+        "hotTargets": current_hot_targets(limit=8),
+    }
+
+
+@app.get("/admin")
+def admin_dashboard():
+    if not admin_request_authorized():
+        return Response("未授权：请在 URL 中携带正确的后台 token。", status=401, mimetype="text/plain")
+    return render_template(
+        "admin.html",
+        admin_token=(request.args.get("token") or "") if configured_admin_token() else "",
+    )
+
+
+@app.get("/api/admin/status")
+def admin_status():
+    if not admin_request_authorized():
+        return jsonify({"error": "未授权"}), 401
+    return jsonify(admin_status_payload())
 
 
 def sse_message(payload: dict[str, Any], event: str = "message") -> str:
@@ -2150,6 +2535,7 @@ def search():
                         time.time(),
                     )
                 record_hot_search(payload)
+                record_search_activity("cache-hit", payload, status="cache-hit", result=cached)
                 return jsonify(cached)
 
         async_mode = provider_name == "tripcom" and parse_bool(payload.get("asyncMode"), default=True)
@@ -2185,6 +2571,7 @@ def search():
                 result["summary"]["partial"] = True
             result["summary"]["cacheHit"] = False
             result["summary"]["elapsedMs"] = round((time.perf_counter() - started_at) * 1000, 1)
+            record_search_activity("async-response", payload, status=str(result["summary"].get("jobStatus") or "running"), job_id=str(result["summary"].get("jobId") or result["summary"].get("refreshJobId") or ""), result=result)
             return jsonify(result)
 
         result = run_search_payload(payload, provider_name, quick=False)
@@ -2197,9 +2584,12 @@ def search():
         if key:
             remember_search_result(key, provider_name, result)
         record_hot_search(payload)
+        record_search_activity("sync-complete", payload, status="complete", result=result)
     except (HotelDealError, ProviderError) as exc:
+        record_search_activity("search-error", payload, status="error", error=str(exc))
         return jsonify({"error": str(exc)}), 400
     except Exception as exc:  # pragma: no cover
+        record_search_activity("search-error", payload, status="error", error=str(exc))
         return jsonify({"error": f"搜索失败：{exc}"}), 500
     return jsonify(result)
 

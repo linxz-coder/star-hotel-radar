@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>星级酒店捡漏雷达后台</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='admin.css') }}" />
+  </head>
+  <body>
+    <main class="admin-shell">
+      <header class="admin-header">
+        <div>
+          <div class="eyebrow">Operation Console</div>
+          <h1>星级酒店捡漏雷达后台</h1>
+          <p>监控实时搜索、缓存命中、价格补齐和中文名核验进度</p>
+        </div>
+        <div class="header-actions">
+          <span class="refresh-state" id="refresh-state">准备刷新</span>
+          <button id="refresh-now" type="button">立即刷新</button>
+        </div>
+      </header>
+
+      <section class="metric-grid" id="metric-grid" aria-label="运行指标"></section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <h2>正在执行的任务</h2>
+            <p>当前搜索、补价、中文名核验和续搜状态</p>
+          </div>
+        </div>
+        <div class="job-list" id="active-jobs"></div>
+      </section>
+
+      <section class="panel-grid">
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>最近完成搜索</h2>
+              <p>保留最近完成的搜索条件和结果规模</p>
+            </div>
+          </div>
+          <div class="compact-list" id="completed-jobs"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>异常和续搜</h2>
+              <p>失败任务、Trip.com 临时失败和自动续搜记录</p>
+            </div>
+          </div>
+          <div class="compact-list" id="failed-jobs"></div>
+        </section>
+      </section>
+
+      <section class="panel-grid">
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>搜索活动日志</h2>
+              <p>缓存命中、异步返回、任务开始和任务完成</p>
+            </div>
+          </div>
+          <div class="activity-list" id="activity-list"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>缓存和热搜</h2>
+              <p>本地缓存、MySQL 状态和最近用户热搜</p>
+            </div>
+          </div>
+          <div class="cache-box" id="cache-box"></div>
+          <div class="hot-targets" id="hot-targets"></div>
+        </section>
+      </section>
+    </main>
+
+    <script>
+      window.__ADMIN_TOKEN__ = {{ admin_token|tojson }};
+    </script>
+    <script src="{{ url_for('static', filename='admin.js') }}"></script>
+  </body>
+</html>
