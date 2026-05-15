@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import asyncio
 import hashlib
 import html as html_lib
 import inspect
@@ -1051,12 +1052,16 @@ class TripComProvider:
         fetched: list[dict[str, Any]] = []
         missing = {str(hotel_id) for hotel_id in missing_hotel_ids}
         seeds = self._detail_seed_hotels(missing_hotel_ids)
-        for seed_hotel in seeds[:2]:
-            detail_hotels = self._fetch_detail_context_with_seed_retry(seed_hotel, date_value, missing)
+        if self._detail_fetcher_overridden():
+            for seed_hotel in seeds[:2]:
+                detail_hotels = self._fetch_detail_context_with_seed_retry(seed_hotel, date_value, missing)
+                fetched = self._merge_hotel_lists(fetched, detail_hotels)
+                fetched_ids = {str(hotel.get("hotelId") or "") for hotel in fetched}
+                if missing.issubset(fetched_ids):
+                    break
+        else:
+            detail_hotels = self._fetch_detail_contexts_with_seed_retry(seeds[:2], date_value, missing)
             fetched = self._merge_hotel_lists(fetched, detail_hotels)
-            fetched_ids = {str(hotel.get("hotelId") or "") for hotel in fetched}
-            if missing.issubset(fetched_ids):
-                break
         fetched_ids = {str(hotel.get("hotelId") or "") for hotel in fetched}
         remaining = missing - fetched_ids
         own_seeds = [
@@ -1072,12 +1077,17 @@ class TripComProvider:
                 float(item.get("distanceKm") or 999),
             )
         )
-        for seed_hotel in own_seeds:
-            detail_hotels = self._fetch_detail_context_with_seed_retry(seed_hotel, date_value, missing)
-            fetched = self._merge_hotel_lists(fetched, detail_hotels)
-            fetched_ids = {str(hotel.get("hotelId") or "") for hotel in fetched}
-            if missing.issubset(fetched_ids):
-                break
+        if own_seeds:
+            if self._detail_fetcher_overridden():
+                for seed_hotel in own_seeds:
+                    detail_hotels = self._fetch_detail_context_with_seed_retry(seed_hotel, date_value, missing)
+                    fetched = self._merge_hotel_lists(fetched, detail_hotels)
+                    fetched_ids = {str(hotel.get("hotelId") or "") for hotel in fetched}
+                    if missing.issubset(fetched_ids):
+                        break
+            else:
+                detail_hotels = self._fetch_detail_contexts_with_seed_retry(own_seeds, date_value, missing)
+                fetched = self._merge_hotel_lists(fetched, detail_hotels)
         return fetched
 
     def _hotel_city_id(self, hotel: dict[str, Any], target: dict[str, Any] | None = None) -> int:
@@ -1120,6 +1130,32 @@ class TripComProvider:
                 break
             if any(str(hotel.get("hotelId") or "") == seed_id for hotel in fetched):
                 break
+        return fetched
+
+    def _detail_fetcher_overridden(self) -> bool:
+        return "_fetch_hotel_detail_context_for_date" in self.__dict__
+
+    def _fetch_detail_contexts_with_seed_retry(
+        self,
+        seed_hotels: list[dict[str, Any]],
+        date_value: str,
+        missing: set[str],
+    ) -> list[dict[str, Any]]:
+        fetched: list[dict[str, Any]] = []
+        first_batch = self._fetch_hotel_detail_contexts_for_date(seed_hotels, date_value)
+        for detail_hotels in first_batch.values():
+            fetched = self._merge_hotel_lists(fetched, detail_hotels)
+
+        retry_seeds: list[dict[str, Any]] = []
+        fetched_ids = {str(hotel.get("hotelId") or "") for hotel in fetched}
+        for seed in seed_hotels:
+            seed_id = str(seed.get("hotelId") or "")
+            if seed_id in missing and seed_id not in fetched_ids:
+                retry_seeds.append(seed)
+        if retry_seeds:
+            retry_batch = self._fetch_hotel_detail_contexts_for_date(retry_seeds, date_value)
+            for detail_hotels in retry_batch.values():
+                fetched = self._merge_hotel_lists(fetched, detail_hotels)
         return fetched
 
     def _should_fetch_own_detail_seed(self, seed_hotel: dict[str, Any]) -> bool:
@@ -1671,7 +1707,11 @@ class TripComProvider:
             source="Trip.com 详情页中文名",
         )
 
-    def _fetch_hotel_detail_context_for_date(self, seed_hotel: dict[str, Any], check_in: str) -> list[dict[str, Any]]:
+    def _fetch_hotel_detail_contexts_for_date(
+        self,
+        seed_hotels: list[dict[str, Any]],
+        check_in: str,
+    ) -> dict[str, list[dict[str, Any]]]:
         try:
             from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
             from playwright.sync_api import sync_playwright
@@ -1681,112 +1721,177 @@ class TripComProvider:
         checkin_date = parse_date(check_in)
         checkout_date = checkin_date + dt.timedelta(days=1)
         target = self._last_target or {}
-        hotel_id = str(seed_hotel.get("hotelId") or "")
-        city_id = self._hotel_city_id(seed_hotel, target)
-        if not hotel_id or not city_id:
-            return []
-
-        urls = list(
-            dict.fromkeys(
-                [
-                    self._detail_url(hotel_id, city_id, checkin_date, checkout_date),
-                    self._detail_v2_url(hotel_id, city_id, checkin_date, checkout_date),
-                ]
+        prepared: list[tuple[str, dict[str, Any], int, list[str]]] = []
+        for seed_hotel in seed_hotels:
+            hotel_id = str(seed_hotel.get("hotelId") or "")
+            city_id = self._hotel_city_id(seed_hotel, target)
+            if not hotel_id or not city_id:
+                continue
+            urls = list(
+                dict.fromkeys(
+                    [
+                        self._detail_url(hotel_id, city_id, checkin_date, checkout_date),
+                        self._detail_v2_url(hotel_id, city_id, checkin_date, checkout_date),
+                    ]
+                )
             )
-        )
-        detail_items: list[dict[str, Any]] = []
-        room_price_seen = False
-        nearby_seen = False
-
-        def seed_item_from_room_price(price: int) -> dict[str, Any]:
-            item = dict(seed_hotel)
-            item.setdefault("city", simplify_chinese_text(target.get("city") or ""))
-            item["cityId"] = city_id
-            item["currentPrice"] = price
-            item["priceDate"] = checkin_date.isoformat()
-            item["priceIncludesTax"] = True
-            item["priceSource"] = "Trip.com detail room total incl. taxes & fees"
-            item["tripUrl"] = self._detail_url(hotel_id, city_id, checkin_date, checkout_date)
-            return item
-
-        def collect_response_items(response: Any) -> None:
-            nonlocal room_price_seen, nearby_seen
-            response_url = str(response.url or "")
-            is_room_response = "getHotelRoomList" in response_url
-            is_nearby_response = "ctGetNearbyHotelList" in response_url
-            if not is_room_response and not is_nearby_response:
-                return
-            try:
-                data = response.json()
-            except Exception:
-                return
-            if is_room_response:
-                price = self._extract_detail_room_tax_price(data)
-                if price is not None:
-                    detail_items.append(seed_item_from_room_price(price))
-                    room_price_seen = True
-            elif is_nearby_response:
-                rows = (((data or {}).get("data") or {}).get("hotelList") or []) if isinstance(data, dict) else []
-                for row in rows:
-                    if isinstance(row, dict):
-                        item = self._normalize_trip_detail_nearby_hotel(row, checkin_date, checkout_date, target)
-                        if item:
-                            detail_items.append(item)
-                nearby_seen = bool(rows)
+            prepared.append((hotel_id, seed_hotel, city_id, urls))
+        if not prepared:
+            return {}
 
         with self._lock:
             try:
-                with sync_playwright() as playwright:
-                    browser = playwright.chromium.launch(
-                        headless=True,
-                        args=["--disable-blink-features=AutomationControlled"],
+                return asyncio.run(
+                    self._fetch_hotel_detail_contexts_for_date_async(
+                        prepared,
+                        checkin_date,
+                        checkout_date,
+                        target,
                     )
-                    context = browser.new_context(
-                        user_agent=UA,
-                        locale="zh-CN",
-                        timezone_id="Asia/Shanghai",
-                        viewport={"width": 1440, "height": 1400},
-                    )
-                    context.route(
-                        "**/*",
-                        lambda route: route.abort()
-                        if route.request.resource_type in {"image", "media", "font"}
-                        else route.continue_(),
-                    )
-                    context.add_init_script(
-                        """
+                )
+            except PlaywrightTimeoutError as exc:
+                raise ProviderError("Trip.com 酒店详情加载超时，请稍后重试") from exc
+            except Exception as exc:
+                raise ProviderError(f"Trip.com 酒店详情抓取失败：{exc}") from exc
+
+    async def _fetch_hotel_detail_contexts_for_date_async(
+        self,
+        prepared: list[tuple[str, dict[str, Any], int, list[str]]],
+        checkin_date: dt.date,
+        checkout_date: dt.date,
+        target: dict[str, Any],
+    ) -> dict[str, list[dict[str, Any]]]:
+        from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+        from playwright.async_api import async_playwright
+
+        results: dict[str, list[dict[str, Any]]] = {hotel_id: [] for hotel_id, *_rest in prepared}
+        max_pages = max(1, int(os.environ.get("HOTEL_DEAL_DETAIL_FETCH_CONCURRENCY", "3")))
+        semaphore = asyncio.Semaphore(max_pages)
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            context = await browser.new_context(
+                user_agent=UA,
+                locale="zh-CN",
+                timezone_id="Asia/Shanghai",
+                viewport={"width": 1440, "height": 1400},
+            )
+
+            async def route_handler(route: Any) -> None:
+                if route.request.resource_type in {"image", "media", "font"}:
+                    await route.abort()
+                else:
+                    await route.continue_()
+
+            await context.route("**/*", route_handler)
+            await context.add_init_script(
+                """
 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
 Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
 Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
-                        """
-                    )
-                    page = context.new_page()
-                    page.on("response", collect_response_items)
-                    for url in urls:
-                        try:
-                            page.goto(url, wait_until="domcontentloaded", timeout=35000)
-                        except PlaywrightTimeoutError:
-                            if url == urls[-1]:
-                                raise
-                            continue
-                        for _ in range(12):
-                            if room_price_seen and nearby_seen:
-                                break
-                            page.wait_for_timeout(800)
-                        if room_price_seen:
-                            break
-                    page.remove_listener("response", collect_response_items)
-                    browser.close()
-            except PlaywrightTimeoutError as exc:
-                if detail_items:
-                    return self._dedupe_hotel_items(detail_items)
-                raise ProviderError("Trip.com 酒店详情加载超时，请稍后重试") from exc
-            except Exception as exc:
-                if detail_items:
-                    return self._dedupe_hotel_items(detail_items)
-                raise ProviderError(f"Trip.com 酒店详情抓取失败：{exc}") from exc
+                """
+            )
 
-        return self._dedupe_hotel_items(detail_items)
+            async def fetch_seed(
+                hotel_id: str,
+                seed_hotel: dict[str, Any],
+                city_id: int,
+                urls: list[str],
+            ) -> tuple[str, list[dict[str, Any]]]:
+                async with semaphore:
+                    detail_items: list[dict[str, Any]] = []
+                    room_price_seen = False
+                    nearby_seen = False
+                    response_tasks: list[asyncio.Task[Any]] = []
+
+                    def seed_item_from_room_price(price: int) -> dict[str, Any]:
+                        item = dict(seed_hotel)
+                        item.setdefault("city", simplify_chinese_text(target.get("city") or ""))
+                        item["cityId"] = city_id
+                        item["currentPrice"] = price
+                        item["priceDate"] = checkin_date.isoformat()
+                        item["priceIncludesTax"] = True
+                        item["priceSource"] = "Trip.com detail room total incl. taxes & fees"
+                        item["tripUrl"] = self._detail_url(hotel_id, city_id, checkin_date, checkout_date)
+                        return item
+
+                    async def collect_response_items(response: Any) -> None:
+                        nonlocal room_price_seen, nearby_seen
+                        response_url = str(response.url or "")
+                        is_room_response = "getHotelRoomList" in response_url
+                        is_nearby_response = "ctGetNearbyHotelList" in response_url
+                        if not is_room_response and not is_nearby_response:
+                            return
+                        try:
+                            data = await asyncio.wait_for(response.json(), timeout=3)
+                        except Exception:
+                            return
+                        if is_room_response:
+                            price = self._extract_detail_room_tax_price(data)
+                            if price is not None:
+                                detail_items.append(seed_item_from_room_price(price))
+                                room_price_seen = True
+                        elif is_nearby_response:
+                            rows = (((data or {}).get("data") or {}).get("hotelList") or []) if isinstance(data, dict) else []
+                            for row in rows:
+                                if isinstance(row, dict):
+                                    item = self._normalize_trip_detail_nearby_hotel(row, checkin_date, checkout_date, target)
+                                    if item:
+                                        detail_items.append(item)
+                            nearby_seen = bool(rows)
+
+                    page = await context.new_page()
+
+                    def on_response(response: Any) -> None:
+                        response_tasks.append(asyncio.create_task(collect_response_items(response)))
+
+                    page.on("response", on_response)
+                    try:
+                        for url in urls:
+                            try:
+                                await page.goto(url, wait_until="domcontentloaded", timeout=35000)
+                            except PlaywrightTimeoutError:
+                                if url == urls[-1]:
+                                    break
+                                continue
+                            for _ in range(12):
+                                if room_price_seen and nearby_seen:
+                                    break
+                                await page.wait_for_timeout(800)
+                            if room_price_seen:
+                                break
+                        if response_tasks:
+                            _done, pending = await asyncio.wait(response_tasks, timeout=2)
+                            for task in pending:
+                                task.cancel()
+                    finally:
+                        page.remove_listener("response", on_response)
+                        await page.close()
+                    return hotel_id, self._dedupe_hotel_items(detail_items)
+
+            pairs = await asyncio.gather(
+                *(
+                    asyncio.wait_for(fetch_seed(hotel_id, seed_hotel, city_id, urls), timeout=95)
+                    for hotel_id, seed_hotel, city_id, urls in prepared
+                ),
+                return_exceptions=True,
+            )
+            await browser.close()
+        for pair in pairs:
+            if isinstance(pair, Exception):
+                continue
+            hotel_id, items = pair
+            results[hotel_id] = items
+        return results
+
+    def _fetch_hotel_detail_context_for_date(self, seed_hotel: dict[str, Any], check_in: str) -> list[dict[str, Any]]:
+        hotel_id = str(seed_hotel.get("hotelId") or "")
+        if not hotel_id:
+            return []
+        return self._fetch_hotel_detail_contexts_for_date([seed_hotel], check_in).get(hotel_id, [])
 
     def _detail_v2_url(self, hotel_id: str, city_id: int | str, check_in: dt.date, check_out: dt.date) -> str:
         params = {

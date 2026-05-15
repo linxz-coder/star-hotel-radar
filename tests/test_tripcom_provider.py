@@ -632,6 +632,59 @@ def test_get_hotel_prices_fetches_own_detail_for_remaining_brand_seed(monkeypatc
     assert prices["54506880"]["2026-06-08"] == 1164
 
 
+def test_get_hotel_prices_batches_default_detail_fetches(monkeypatch):
+    provider = TripComProvider()
+    provider._last_target = target_hotel()
+    provider._last_search_targets = [target_hotel()]
+    provider._candidate_cache = {
+        "near-a": {
+            "hotelId": "near-a",
+            "hotelName": "附近独立酒店A",
+            "starRating": 4,
+            "distanceKm": 0.4,
+            "currentPrice": 320,
+        },
+        "54506880": {
+            "hotelId": "54506880",
+            "hotelName": "深圳国际会展中心皇冠假日酒店",
+            "starRating": 5,
+            "distanceKm": 1.5,
+            "currentPrice": 552,
+        },
+    }
+    provider._price_cache = {
+        "near-a": {"2026-06-01": 320},
+        "54506880": {"2026-06-01": 552},
+    }
+    batch_calls: list[list[str]] = []
+
+    monkeypatch.setattr(provider, "_fetch_hotel_list_for_date", lambda *args, **kwargs: [])
+
+    def fake_batch(seeds, date_value):
+        batch_calls.append([str(seed.get("hotelId")) for seed in seeds])
+        return {
+            "54506880": [
+                {
+                    **provider._candidate_cache["54506880"],
+                    "currentPrice": 1164,
+                    "priceIncludesTax": True,
+                    "priceSource": "Trip.com detail room total incl. taxes & fees",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(provider, "_fetch_hotel_detail_contexts_for_date", fake_batch)
+
+    prices = provider.get_hotel_prices(
+        ["near-a", "54506880"],
+        ["2026-06-01", "2026-06-08"],
+    )
+
+    assert batch_calls
+    assert any("54506880" in call for call in batch_calls)
+    assert prices["54506880"]["2026-06-08"] == 1164
+
+
 def test_detail_room_price_uses_total_tax_price():
     provider = TripComProvider()
     data = {
