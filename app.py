@@ -56,7 +56,7 @@ MAX_HOT_SEARCH_RECORDS = 80
 MAX_SEARCH_ACTIVITY_ITEMS = 200
 HOT_SEARCH_TTL_SECONDS = 30 * 24 * 60 * 60
 HOTEL_NAME_CACHE_TTL_SECONDS = int(os.environ.get("HOTEL_DEAL_NAME_CACHE_TTL_SECONDS", str(365 * 24 * 60 * 60)))
-CACHE_LOGIC_VERSION = "search_v41_hotel_date_price_cache"
+CACHE_LOGIC_VERSION = "search_v42_parallel_date_prices"
 MYSQL_SEARCH_CACHE = MySQLSearchCache.from_env()
 MYSQL_HOTEL_NAME_CACHE = MySQLHotelNameCache.from_env()
 MYSQL_HOTEL_PRICE_CACHE = MySQLHotelPriceCache.from_env()
@@ -1852,16 +1852,19 @@ def start_background_search_job(
                     total_hotels = int(progress_info.get("totalHotels") or 0)
                     missing = int(progress_info.get("missingHotelCount") or 0)
                     backfill_mode = str(progress_info.get("backfillMode") or "")
+                    parallel_dates = bool(progress_info.get("parallelDates"))
                     if backfill_mode == "final" and phase == "detail":
                         message = f"搜索完成前正在总检查 {date_value} 的待补价酒店，逐家打开 Trip.com 详情页补齐含税价。"
                     elif backfill_mode == "pending" and phase == "detail":
                         message = f"正在异步检查 {date_value} 仍待补价的酒店，逐家打开 Trip.com 详情页补齐含税价。"
                     elif phase == "start":
-                        message = f"正在补齐对比日期含税价：{date_value}（第 {date_index}/{total} 个日期），当前已匹配 {priced}/{total_hotels} 家。"
+                        prefix = "正在并行补齐对比日期含税价" if parallel_dates else "正在补齐对比日期含税价"
+                        message = f"{prefix}：{date_value}（第 {date_index}/{total} 个日期），当前已匹配 {priced}/{total_hotels} 家。"
                     elif phase == "list":
                         message = f"{date_value} 静态列表已匹配 {priced}/{total_hotels} 家，正在打开该日期列表页批量补齐含税价。"
                     elif phase == "dom-list":
-                        message = f"正在从 {date_value} 的 Trip.com 列表页批量读取含税价，当前已匹配 {priced}/{total_hotels} 家。"
+                        prefix = "正在并行打开 Trip.com 日期列表页" if parallel_dates else f"正在从 {date_value} 的 Trip.com 列表页"
+                        message = f"{prefix}批量读取含税价，当前 {date_value} 已匹配 {priced}/{total_hotels} 家。"
                     elif phase == "detail":
                         message = f"正在打开 {date_value} 的酒店详情页补齐含税价，当前已匹配 {priced}/{total_hotels} 家。"
                     elif phase == "deep":

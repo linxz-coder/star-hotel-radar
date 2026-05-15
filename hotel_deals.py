@@ -1587,6 +1587,88 @@ def search_deals(
 
     selected_date_price_checked = selected_price_known or selected_value not in compare_dates
     fetched_compare_dates: set[str] = {selected_value} if selected_date_price_checked else set()
+    parallel_price_fetcher = getattr(provider, "get_hotel_prices_for_dates_parallel", None)
+    parallel_compare_dates = [
+        compare_date
+        for compare_date in compare_dates
+        if compare_date not in fetched_compare_dates
+    ]
+    if callable(parallel_price_fetcher) and len(parallel_compare_dates) > 1:
+        requested_hotel_ids = list(hotel_ids)
+
+        def publish_parallel_price_progress(progress_info: dict[str, Any]) -> None:
+            date_value = str(progress_info.get("date") or "")
+            phase = str(progress_info.get("phase") or "")
+            normalized = dict(progress_info)
+            date_index = compare_dates.index(date_value) + 1 if date_value in compare_dates else int(progress_info.get("dateIndex") or 0)
+            completed_from_batch = int(progress_info.get("completedDates") or 0)
+            normalized.update(
+                {
+                    "date": date_value,
+                    "dateIndex": date_index,
+                    "completedDates": min(len(completed_compare_dates) + completed_from_batch, len(compare_dates)),
+                    "totalDates": len(compare_dates),
+                    "totalExpectedPriceCount": len(hotel_ids) * len(compare_dates),
+                    "parallelDates": True,
+                }
+            )
+            if price_progress_callback:
+                price_progress_callback(normalized)
+            if phase in {"list", "dom-list", "detail", "deep", "complete"}:
+                publish_price_progress_candidate_snapshot()
+
+        try:
+            bulk_prices = parallel_price_fetcher(
+                requested_hotel_ids,
+                parallel_compare_dates,
+                progress_callback=publish_parallel_price_progress,
+            )
+        except Exception:
+            bulk_prices = {}
+        if bulk_prices:
+            for hotel_id, prices in bulk_prices.items():
+                if not isinstance(prices, dict):
+                    continue
+                for compare_date in parallel_compare_dates:
+                    if compare_date in prices:
+                        price_map.setdefault(str(hotel_id), {})[compare_date] = prices.get(compare_date)
+            price_attempted_keys.update(
+                (str(hotel_id), compare_date)
+                for hotel_id in requested_hotel_ids
+                for compare_date in parallel_compare_dates
+            )
+            fetched_compare_dates.update(parallel_compare_dates)
+            for compare_date in parallel_compare_dates:
+                if compare_date not in completed_compare_dates:
+                    completed_compare_dates.append(compare_date)
+            merge_cached_candidate_snapshot()
+            backfill_changed = backfill_missing_prices_for_dates(list(fetched_compare_dates))
+            if progress_callback:
+                progress_callback(
+                    search_result_from_price_map(
+                        provider,
+                        city=city,
+                        target_hotel_name=target_hotel_name,
+                        selected=selected,
+                        radius_km=radius_km,
+                        min_star=min_star,
+                        min_price=min_price,
+                        max_price=max_price,
+                        sort_by=sort_by,
+                        target=target,
+                        compare_info=compare_info,
+                        compare_dates=compare_dates,
+                        attempts=attempts,
+                        max_radius_km=max_radius_km,
+                        nearby_hotels=nearby_hotels,
+                        price_map=price_map,
+                        partial=True,
+                        completed_compare_dates=completed_compare_dates,
+                    )
+                )
+                if backfill_changed:
+                    publish_price_progress_candidate_snapshot()
+
     for compare_date in compare_dates:
         if compare_date in fetched_compare_dates:
             continue

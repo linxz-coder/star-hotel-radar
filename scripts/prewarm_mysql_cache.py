@@ -13,6 +13,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from app import (  # noqa: E402
+    MYSQL_HOTEL_PRICE_CACHE,
     MYSQL_SEARCH_CACHE,
     cache_key,
     current_hot_targets,
@@ -20,6 +21,7 @@ from app import (  # noqa: E402
     remember_search_result,
     run_search_payload,
 )
+from hotel_deals import get_compare_date_info  # noqa: E402
 from providers import ProviderError, TripComProvider  # noqa: E402
 
 
@@ -71,6 +73,25 @@ def store_result_for_payloads(payload: dict[str, Any], result: dict[str, Any], p
         remember_search_result(cache_key(no_hint_payload), provider_name, result)
 
 
+def prewarm_price_dates(selected_date: str) -> list[str]:
+    dates: list[str] = []
+    for date_value in [selected_date, *get_compare_date_info(selected_date)["compareDates"]]:
+        date_value = str(date_value or "").strip()
+        if date_value and date_value not in dates:
+            dates.append(date_value)
+    return dates
+
+
+def ensure_price_cache_schema() -> bool:
+    if not MYSQL_HOTEL_PRICE_CACHE or not MYSQL_HOTEL_PRICE_CACHE.available():
+        return False
+    try:
+        MYSQL_HOTEL_PRICE_CACHE.ensure_schema()
+        return True
+    except Exception:
+        return False
+
+
 def prewarm_one(
     target: dict[str, Any],
     selected_date: str,
@@ -101,6 +122,7 @@ def prewarm_one(
     summary["prewarmedAt"] = time.time()
     summary["prewarmMode"] = used_mode
     summary["prewarmElapsedMs"] = round((time.perf_counter() - started_at) * 1000, 1)
+    summary["prewarmPriceDates"] = prewarm_price_dates(selected_date)
     store_result_for_payloads(payload, result)
 
     return {
@@ -112,6 +134,8 @@ def prewarm_one(
         "dealCount": summary.get("dealCount"),
         "recommendedCount": summary.get("recommendedCount"),
         "elapsedMs": summary["prewarmElapsedMs"],
+        "priceDateCount": len(summary["prewarmPriceDates"]),
+        "hotelPriceCacheEnabled": bool(MYSQL_HOTEL_PRICE_CACHE and MYSQL_HOTEL_PRICE_CACHE.available()),
         "targetHint": bool(payload.get("targetHint")),
     }
 
@@ -129,6 +153,7 @@ def main() -> int:
 
     targets = current_hot_targets(limit=max(1, args.limit))
     dates = parse_dates(args.dates)
+    price_schema_ready = ensure_price_cache_schema()
     output: list[dict[str, Any]] = []
     print(
         json.dumps(
@@ -138,6 +163,8 @@ def main() -> int:
                 "dates": dates,
                 "mode": args.mode,
                 "mysqlEnabled": bool(MYSQL_SEARCH_CACHE and MYSQL_SEARCH_CACHE.available()),
+                "hotelPriceCacheEnabled": bool(MYSQL_HOTEL_PRICE_CACHE and MYSQL_HOTEL_PRICE_CACHE.available()),
+                "hotelPriceSchemaReady": price_schema_ready,
             },
             ensure_ascii=False,
         ),

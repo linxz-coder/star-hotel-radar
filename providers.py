@@ -1101,6 +1101,193 @@ class TripComProvider:
             for hotel_id in hotel_ids
         }
 
+    def get_hotel_prices_for_dates_parallel(
+        self,
+        hotel_ids: list[str],
+        dates: list[str],
+        progress_callback: Any | None = None,
+    ) -> dict[str, dict[str, int | None]]:
+        if len(dates) <= 1 or not self._parallel_date_price_enabled():
+            return self.get_hotel_prices(hotel_ids, dates, progress_callback=progress_callback)
+        if not self._last_target:
+            raise ProviderError("Trip.com Provider 还没有目标酒店上下文")
+
+        hotel_ids = [str(hotel_id) for hotel_id in hotel_ids if str(hotel_id or "").strip()]
+        dates = [str(date_value) for date_value in dates if str(date_value or "").strip()]
+        self._hydrate_persistent_price_cache(hotel_ids, dates)
+        search_targets = self._last_search_targets or [self._last_target]
+
+        for date_index, date_value in enumerate(dates, start=1):
+            if progress_callback:
+                self._publish_price_progress(
+                    progress_callback,
+                    hotel_ids=hotel_ids,
+                    dates=dates,
+                    date_value=date_value,
+                    date_index=date_index,
+                    completed_dates=date_index - 1,
+                    phase="start",
+                )
+            if all(self._cached_price_available(str(hotel_id), date_value) for hotel_id in hotel_ids):
+                if progress_callback:
+                    self._publish_price_progress(
+                        progress_callback,
+                        hotel_ids=hotel_ids,
+                        dates=dates,
+                        date_value=date_value,
+                        date_index=date_index,
+                        completed_dates=date_index,
+                        phase="complete",
+                    )
+                continue
+
+            hotels_for_date: list[dict[str, Any]] = []
+            for search_target in search_targets:
+                if not search_target:
+                    continue
+                try:
+                    fetched_hotels = self._fetch_hotel_list_for_date(search_target, date_value, fast_mode=True)
+                except ProviderError:
+                    continue
+                hotels_for_date = self._merge_hotel_lists(hotels_for_date, fetched_hotels)
+            for hotel in hotels_for_date:
+                hotel_id = str(hotel.get("hotelId") or "")
+                if not hotel_id:
+                    continue
+                self._candidate_cache[hotel_id] = hotel
+                if self._hotel_price_matches_date(hotel, date_value):
+                    self._store_price_if_available(hotel_id, date_value, hotel.get("currentPrice"))
+            if progress_callback:
+                self._publish_price_progress(
+                    progress_callback,
+                    hotel_ids=hotel_ids,
+                    dates=dates,
+                    date_value=date_value,
+                    date_index=date_index,
+                    completed_dates=date_index - 1,
+                    phase="list",
+                )
+
+        missing_by_date = {
+            date_value: [
+                str(hotel_id)
+                for hotel_id in hotel_ids
+                if not self._cached_price_available(str(hotel_id), date_value)
+            ]
+            for date_value in dates
+        }
+        missing_by_date = {date_value: missing for date_value, missing in missing_by_date.items() if missing}
+        if missing_by_date and self._should_run_list_dom_backfill():
+            if progress_callback:
+                for date_index, date_value in enumerate(dates, start=1):
+                    if date_value in missing_by_date:
+                        self._publish_price_progress(
+                            progress_callback,
+                            hotel_ids=hotel_ids,
+                            dates=dates,
+                            date_value=date_value,
+                            date_index=date_index,
+                            completed_dates=date_index - 1,
+                            phase="dom-list",
+                        )
+            dom_results = self._fetch_list_dom_prices_for_missing_dates(missing_by_date)
+            for date_value, dom_hotels in dom_results.items():
+                for hotel in dom_hotels:
+                    hotel_id = str(hotel.get("hotelId") or "")
+                    if not hotel_id:
+                        continue
+                    self._candidate_cache[hotel_id] = hotel
+                    if self._hotel_price_matches_date(hotel, date_value):
+                        self._store_price_if_available(hotel_id, date_value, hotel.get("currentPrice"))
+                if progress_callback:
+                    date_index = dates.index(date_value) + 1
+                    self._publish_price_progress(
+                        progress_callback,
+                        hotel_ids=hotel_ids,
+                        dates=dates,
+                        date_value=date_value,
+                        date_index=date_index,
+                        completed_dates=date_index - 1,
+                        phase="dom-list",
+                    )
+
+        for date_index, date_value in enumerate(dates, start=1):
+            still_missing = [
+                str(hotel_id)
+                for hotel_id in hotel_ids
+                if not self._cached_price_available(str(hotel_id), date_value)
+            ]
+            if still_missing:
+                if progress_callback:
+                    self._publish_price_progress(
+                        progress_callback,
+                        hotel_ids=hotel_ids,
+                        dates=dates,
+                        date_value=date_value,
+                        date_index=date_index,
+                        completed_dates=date_index - 1,
+                        phase="detail",
+                    )
+                detail_hotels = self._fetch_detail_prices_for_missing(date_value, still_missing)
+                for hotel in detail_hotels:
+                    hotel_id = str(hotel.get("hotelId") or "")
+                    if not hotel_id:
+                        continue
+                    self._candidate_cache[hotel_id] = hotel
+                    self._store_price_if_available(hotel_id, date_value, hotel.get("currentPrice"))
+
+            still_missing = [
+                str(hotel_id)
+                for hotel_id in hotel_ids
+                if not self._cached_price_available(str(hotel_id), date_value)
+            ]
+            if still_missing and self._deep_list_fallback_enabled():
+                if progress_callback:
+                    self._publish_price_progress(
+                        progress_callback,
+                        hotel_ids=hotel_ids,
+                        dates=dates,
+                        date_value=date_value,
+                        date_index=date_index,
+                        completed_dates=date_index - 1,
+                        phase="deep",
+                    )
+                deep_hotels: list[dict[str, Any]] = []
+                for search_target in search_targets[:1]:
+                    if not search_target:
+                        continue
+                    try:
+                        fetched_hotels = self._fetch_hotel_list_for_date(search_target, date_value, deep_mode=True)
+                    except ProviderError:
+                        continue
+                    deep_hotels = self._merge_hotel_lists(deep_hotels, fetched_hotels)
+                for hotel in deep_hotels:
+                    hotel_id = str(hotel.get("hotelId") or "")
+                    if not hotel_id:
+                        continue
+                    self._candidate_cache[hotel_id] = hotel
+                    if self._hotel_price_matches_date(hotel, date_value):
+                        self._store_price_if_available(hotel_id, date_value, hotel.get("currentPrice"))
+
+            if progress_callback:
+                self._publish_price_progress(
+                    progress_callback,
+                    hotel_ids=hotel_ids,
+                    dates=dates,
+                    date_value=date_value,
+                    date_index=date_index,
+                    completed_dates=date_index,
+                    phase="complete",
+                )
+
+        return {
+            str(hotel_id): {
+                date: self._price_cache.get(str(hotel_id), {}).get(date)
+                for date in dates
+            }
+            for hotel_id in hotel_ids
+        }
+
     def _publish_price_progress(
         self,
         progress_callback: Any,
@@ -1148,6 +1335,14 @@ class TripComProvider:
             "on",
         }
 
+    def _parallel_date_price_enabled(self) -> bool:
+        return str(os.environ.get("HOTEL_DEAL_ENABLE_PARALLEL_DATE_PRICES") or "1").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+
     def _list_dom_backfill_enabled(self) -> bool:
         value = str(os.environ.get("HOTEL_DEAL_ENABLE_LIST_DOM_BACKFILL") or "1").strip().lower()
         return value not in {"0", "false", "no", "off"}
@@ -1158,7 +1353,11 @@ class TripComProvider:
     def _should_run_list_dom_backfill(self) -> bool:
         if not self._list_dom_backfill_enabled():
             return False
-        if self._hotel_list_fetcher_overridden() and "_fetch_list_dom_prices_for_missing" not in self.__dict__:
+        if (
+            self._hotel_list_fetcher_overridden()
+            and "_fetch_list_dom_prices_for_missing" not in self.__dict__
+            and "_fetch_list_dom_prices_for_missing_dates" not in self.__dict__
+        ):
             return False
         return True
 
@@ -1190,6 +1389,179 @@ class TripComProvider:
             if missing.issubset(fetched_ids):
                 break
         return fetched
+
+    def _fetch_list_dom_prices_for_missing_dates(
+        self,
+        missing_by_date: dict[str, list[str]],
+    ) -> dict[str, list[dict[str, Any]]]:
+        normalized = {
+            str(date_value): {str(hotel_id) for hotel_id in hotel_ids if str(hotel_id or "").strip()}
+            for date_value, hotel_ids in missing_by_date.items()
+            if str(date_value or "").strip()
+        }
+        normalized = {date_value: hotel_ids for date_value, hotel_ids in normalized.items() if hotel_ids}
+        if not normalized:
+            return {}
+        if len(normalized) == 1:
+            date_value, hotel_ids = next(iter(normalized.items()))
+            return {date_value: self._fetch_list_dom_prices_for_missing(date_value, list(hotel_ids))}
+        try:
+            from playwright.sync_api import sync_playwright  # noqa: F401
+        except Exception:
+            return {
+                date_value: self._fetch_list_dom_prices_for_missing(date_value, list(hotel_ids))
+                for date_value, hotel_ids in normalized.items()
+            }
+        try:
+            with self._lock:
+                return asyncio.run(self._fetch_list_dom_prices_for_missing_dates_async(normalized))
+        except Exception:
+            return {
+                date_value: self._fetch_list_dom_prices_for_missing(date_value, list(hotel_ids))
+                for date_value, hotel_ids in normalized.items()
+            }
+
+    async def _fetch_list_dom_prices_for_missing_dates_async(
+        self,
+        missing_by_date: dict[str, set[str]],
+    ) -> dict[str, list[dict[str, Any]]]:
+        from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+        from playwright.async_api import async_playwright
+
+        results: dict[str, list[dict[str, Any]]] = {date_value: [] for date_value in missing_by_date}
+        search_targets = self._last_search_targets or ([self._last_target] if self._last_target else [])
+        search_targets = [target for target in search_targets[:2] if target]
+        if not search_targets:
+            return results
+        max_pages = max(1, int(os.environ.get("HOTEL_DEAL_DATE_PRICE_FETCH_CONCURRENCY", "3")))
+        semaphore = asyncio.Semaphore(max_pages)
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            context = await browser.new_context(
+                user_agent=UA,
+                locale="zh-CN",
+                timezone_id="Asia/Shanghai",
+                viewport={"width": 1440, "height": 1400},
+            )
+
+            async def route_handler(route: Any) -> None:
+                if route.request.resource_type in {"image", "media", "font"}:
+                    await route.abort()
+                else:
+                    await route.continue_()
+
+            await context.route("**/*", route_handler)
+            await context.add_init_script(
+                """
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
+Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
+                """
+            )
+
+            async def fetch_date(date_value: str, wanted_ids: set[str]) -> tuple[str, list[dict[str, Any]]]:
+                async with semaphore:
+                    checkin_date = parse_date(date_value)
+                    checkout_date = checkin_date + dt.timedelta(days=1)
+                    response_items: list[dict[str, Any]] = []
+
+                    def wanted_tax_prices_found(items: list[dict[str, Any]]) -> bool:
+                        found_ids = {
+                            str(item.get("hotelId") or "")
+                            for item in self._dedupe_hotel_items(items)
+                            if str(item.get("hotelId") or "") in wanted_ids
+                            and item.get("currentPrice") not in (None, "")
+                            and item.get("priceIncludesTax") is not False
+                        }
+                        return wanted_ids.issubset(found_ids)
+
+                    async def collect_response_items(response: Any, target: dict[str, Any]) -> None:
+                        response_url = str(response.url or "")
+                        is_hotel_list_response = (
+                            "/htls/getHotelList" in response_url
+                            or "/restapi/soa2/34951/" in response_url
+                            or "fetchHotelList" in response_url
+                        )
+                        if not is_hotel_list_response:
+                            return
+                        try:
+                            data = await asyncio.wait_for(response.json(), timeout=3)
+                        except Exception:
+                            return
+                        rows = self._hotel_list_rows(data)
+                        for row in rows:
+                            item = self._normalize_trip_hotel(row, checkin_date, checkout_date, target)
+                            if item:
+                                response_items.append(item)
+
+                    for target in search_targets:
+                        page = await context.new_page()
+                        response_tasks: list[asyncio.Task[Any]] = []
+
+                        def on_response(response: Any, target: dict[str, Any] = target) -> None:
+                            response_tasks.append(asyncio.create_task(collect_response_items(response, target)))
+
+                        page.on("response", on_response)
+                        try:
+                            url = self._build_list_url(target, checkin_date, checkout_date)
+                            try:
+                                await page.goto(url, wait_until="domcontentloaded", timeout=35000)
+                            except PlaywrightTimeoutError:
+                                continue
+                            await page.wait_for_timeout(1800)
+                            response_items = self._merge_hotel_lists(
+                                response_items,
+                                self._hotel_cards_from_html(await page.content(), checkin_date, checkout_date, target),
+                            )
+                            last_count = len(self._dedupe_hotel_items(response_items))
+                            stale_rounds = 0
+                            for scroll_index in range(18):
+                                if wanted_tax_prices_found(response_items):
+                                    break
+                                await page.mouse.wheel(0, 1800)
+                                await page.wait_for_timeout(650)
+                                response_items = self._merge_hotel_lists(
+                                    response_items,
+                                    self._hotel_cards_from_html(await page.content(), checkin_date, checkout_date, target),
+                                )
+                                current_count = len(self._dedupe_hotel_items(response_items))
+                                if current_count > last_count:
+                                    last_count = current_count
+                                    stale_rounds = 0
+                                elif scroll_index >= 5:
+                                    stale_rounds += 1
+                                if scroll_index >= 5 and stale_rounds >= 3:
+                                    break
+                            if response_tasks:
+                                _done, pending = await asyncio.wait(response_tasks, timeout=2)
+                                for task in pending:
+                                    task.cancel()
+                            if wanted_tax_prices_found(response_items):
+                                break
+                        finally:
+                            page.remove_listener("response", on_response)
+                            await page.close()
+                    return date_value, self._dedupe_hotel_items(response_items)
+
+            pairs = await asyncio.gather(
+                *(
+                    asyncio.wait_for(fetch_date(date_value, wanted_ids), timeout=90)
+                    for date_value, wanted_ids in missing_by_date.items()
+                ),
+                return_exceptions=True,
+            )
+            await browser.close()
+
+        for pair in pairs:
+            if isinstance(pair, Exception):
+                continue
+            date_value, items = pair
+            results[date_value] = items
+        return results
 
     def _fetch_detail_prices_for_missing(self, date_value: str, missing_hotel_ids: list[str]) -> list[dict[str, Any]]:
         fetched: list[dict[str, Any]] = []

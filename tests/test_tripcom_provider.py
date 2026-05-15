@@ -677,6 +677,63 @@ def test_tax_prices_are_stored_to_persistent_price_cache(monkeypatch):
     assert stored[0]["current_price"] == 356
 
 
+def test_parallel_date_price_fetch_uses_batched_dom_list_before_detail(monkeypatch):
+    provider = TripComProvider()
+    provider._last_target = target_hotel()
+    provider._last_search_targets = [target_hotel()]
+    provider._candidate_cache = {
+        "40365204": {
+            "hotelId": "40365204",
+            "hotelName": "深圳国际会展中心希尔顿花园酒店",
+            "starRating": 4,
+            "distanceKm": 2.3,
+            "currentPrice": None,
+        }
+    }
+    provider._price_cache = {}
+    batch_calls: list[dict[str, list[str]]] = []
+
+    monkeypatch.setattr(provider, "_fetch_hotel_list_for_date", lambda *args, **kwargs: [])
+
+    def fake_batch(missing_by_date):
+        batch_calls.append({date: list(ids) for date, ids in missing_by_date.items()})
+        return {
+            "2026-06-02": [
+                {
+                    **provider._candidate_cache["40365204"],
+                    "currentPrice": 356,
+                    "priceDate": "2026-06-02",
+                    "priceIncludesTax": True,
+                }
+            ],
+            "2026-06-08": [
+                {
+                    **provider._candidate_cache["40365204"],
+                    "currentPrice": 488,
+                    "priceDate": "2026-06-08",
+                    "priceIncludesTax": True,
+                }
+            ],
+        }
+
+    monkeypatch.setattr(provider, "_fetch_list_dom_prices_for_missing_dates", fake_batch)
+    monkeypatch.setattr(
+        provider,
+        "_fetch_detail_prices_for_missing",
+        lambda *args, **kwargs: pytest.fail("detail fallback should not run after batched DOM list prices"),
+    )
+
+    prices = provider.get_hotel_prices_for_dates_parallel(
+        ["40365204"],
+        ["2026-06-02", "2026-06-08"],
+    )
+
+    assert batch_calls
+    assert set(batch_calls[0]) == {"2026-06-02", "2026-06-08"}
+    assert prices["40365204"]["2026-06-02"] == 356
+    assert prices["40365204"]["2026-06-08"] == 488
+
+
 def test_detail_context_recovers_city_id_from_cached_trip_url():
     provider = TripComProvider()
     provider._last_target = target_hotel()

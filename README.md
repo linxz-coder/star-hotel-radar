@@ -14,6 +14,7 @@
 - 相同搜索条件默认缓存 7 天；切换排序会复用缓存并重排，不重复抓取；超过 7 天会重新查询 Trip.com 实时价格
 - 每家酒店每个日期的已核验含税价会单独写入 MySQL，24 小时内复用；勾选“重新实时搜索”时会绕过该价格缓存
 - Trip.com 搜索默认渐进式返回：先返回任务进度；有缓存先秒出缓存，有候选先展示候选，后台继续刷新实时价格和完整比价
+- Trip.com 对比日期补价会并发打开多个日期列表页，并复用同一个浏览器上下文批量读取含税价，仍缺价时才逐家详情页兜底
 - 支持对最近热搜城市/酒店做 MySQL 定时预热，热门搜索可直接命中缓存
 - 数据层使用 Provider 接口：页面默认使用 `TripComProvider` 实时查询；本地样例/导入数据接口保留给后续人工导入
 
@@ -58,13 +59,15 @@ export HOTEL_DEAL_MYSQL_ENABLED=1
 export HOTEL_DEAL_MYSQL_NAME_TABLE=hotel_name_cache
 export HOTEL_DEAL_MYSQL_PRICE_TABLE=hotel_price_cache
 export HOTEL_DEAL_HOTEL_PRICE_CACHE_TTL_SECONDS=86400
+export HOTEL_DEAL_ENABLE_PARALLEL_DATE_PRICES=1
+export HOTEL_DEAL_DATE_PRICE_FETCH_CONCURRENCY=3
 ```
 
 如果 MySQL 不可用，应用会自动退回文件缓存和实时搜索，不会阻断用户搜索。导入酒店数据后，本地数据源缓存会自动清空。
 
 ## 热门搜索预热
 
-预热脚本会读取“最近热搜 + 默认热门目标”，为热门城市/酒店提前查询 Trip.com 并写入 MySQL 和文件缓存。默认只预热应用默认入住日期，可用 `--dates` 指定多个日期。
+预热脚本会读取“最近热搜 + 默认热门目标”，为热门城市/酒店提前查询 Trip.com 并写入 MySQL 和文件缓存。完整预热会同时补齐目标日期和对比日期含税价，并写入 `hotel_price_cache`。默认只预热应用默认入住日期，可用 `--dates` 指定多个日期。
 
 手动轻量预热一个目标：
 
