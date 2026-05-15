@@ -106,6 +106,12 @@ python3 app.py
 http://127.0.0.1:5013
 ```
 
+后台监控页：
+
+```text
+http://127.0.0.1:5013/admin
+```
+
 ## 测试
 
 ```bash
@@ -182,3 +188,11 @@ scripts/start_tunnel.sh
 ```
 
 脚本会检查本地 Flask 服务，然后启动 Cloudflare Quick Tunnel 并输出公网地址。
+
+手机访问后台时，使用脚本输出的“手机后台地址”，格式是：
+
+```text
+https://xxxx.trycloudflare.com/admin
+```
+
+如果以后设置了 `HOTEL_DEAL_ADMIN_TOKEN`，访问后台时需要在地址后追加 `?token=你的token`。

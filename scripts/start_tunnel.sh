@@ -10,12 +10,14 @@ TUNNEL_PLIST="${TUNNEL_PLIST:-${APP_DIR}/deploy/launchd/${TUNNEL_LABEL}.plist}"
 CLOUDFLARED="${CLOUDFLARED:-/opt/homebrew/bin/cloudflared}"
 LOCAL_HEALTH_URL="http://127.0.0.1:${PORT}/api/health"
 LOCAL_SITE_URL="http://127.0.0.1:${PORT}"
+LOCAL_ADMIN_URL="${LOCAL_SITE_URL}/admin"
 LOG_DIR="${APP_DIR}/.cache"
 APP_LOG="${LOG_DIR}/app.out.log"
 APP_ERR="${LOG_DIR}/app.err.log"
 TUNNEL_OUT_LOG="${LOG_DIR}/cloudflared.log"
 TUNNEL_ERR_LOG="${LOG_DIR}/cloudflared.err.log"
 LATEST_URL_FILE="${LOG_DIR}/latest_tunnel_url.txt"
+LATEST_ADMIN_URL_FILE="${LOG_DIR}/latest_admin_url.txt"
 USER_ID="$(id -u)"
 
 file_size() {
@@ -29,6 +31,20 @@ file_size() {
 
 extract_tunnel_url() {
   grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' | tail -n 1 || true
+}
+
+print_tunnel_urls() {
+  local url="$1"
+  local admin_url="${url}/admin"
+  printf "%s\n" "$url" > "$LATEST_URL_FILE"
+  printf "%s\n" "$admin_url" > "$LATEST_ADMIN_URL_FILE"
+  echo
+  echo "前台 Tunnel 地址：$url"
+  echo "手机后台地址：$admin_url"
+  echo "本地前台地址：$LOCAL_SITE_URL"
+  echo "本地后台地址：$LOCAL_ADMIN_URL"
+  echo "地址已保存：$LATEST_URL_FILE"
+  echo "后台地址已保存：$LATEST_ADMIN_URL_FILE"
 }
 
 cd "$APP_DIR"
@@ -86,11 +102,7 @@ $(tail -c +"$((before_out_size + 1))" "$TUNNEL_OUT_LOG" 2>/dev/null || true)"
   fi
   url="$(printf "%s\n" "$new_log" | extract_tunnel_url)"
   if [[ -n "$url" ]]; then
-    printf "%s\n" "$url" > "$LATEST_URL_FILE"
-    echo
-    echo "Tunnel 地址：$url"
-    echo "本地地址：$LOCAL_SITE_URL"
-    echo "地址已保存：$LATEST_URL_FILE"
+    print_tunnel_urls "$url"
     exit 0
   fi
   sleep 1
@@ -103,11 +115,7 @@ url="$(
   } | extract_tunnel_url
 )"
 if [[ -n "$url" ]]; then
-  printf "%s\n" "$url" > "$LATEST_URL_FILE"
-  echo
-  echo "Tunnel 地址：$url"
-  echo "本地地址：$LOCAL_SITE_URL"
-  echo "地址已保存：$LATEST_URL_FILE"
+  print_tunnel_urls "$url"
   exit 0
 fi
 
