@@ -632,6 +632,8 @@ def hotel_price_for_date(
     price = hotel.get("currentPrice")
     if price in (None, ""):
         return None
+    if hotel.get("priceIncludesTax") is False:
+        return None
     price_date = str(hotel.get("priceDate") or hotel.get("selectedDate") or "").strip()
     if price_date and price_date != date_value:
         return None
@@ -649,6 +651,10 @@ def prefer_hotel_candidate(candidate: dict[str, Any], current: dict[str, Any], s
     current_has_selected_price = hotel_price_for_selected_date(current, selected_value) is not None
     if candidate_has_selected_price != current_has_selected_price:
         return candidate_has_selected_price
+    candidate_has_visible_price = candidate.get("visiblePrice") not in (None, "")
+    current_has_visible_price = current.get("visiblePrice") not in (None, "")
+    if candidate_has_visible_price != current_has_visible_price:
+        return candidate_has_visible_price
     candidate_has_coords = candidate.get("latitude") not in (None, "") and candidate.get("longitude") not in (None, "")
     current_has_coords = current.get("latitude") not in (None, "") and current.get("longitude") not in (None, "")
     if candidate_has_coords != current_has_coords:
@@ -841,6 +847,9 @@ def hotel_result_payload(
         "distanceKm": round(float(hotel.get("distanceKm") or 0), 1),
         "selectedDate": selected.isoformat(),
         "currentPrice": int(current_price) if current_price not in (None, "") else None,
+        "visiblePrice": int(hotel.get("visiblePrice")) if hotel.get("visiblePrice") not in (None, "") else None,
+        "visiblePriceDate": hotel.get("visiblePriceDate") or "",
+        "currentPricePreview": int(hotel.get("currentPricePreview")) if hotel.get("currentPricePreview") not in (None, "") else None,
         "priceIncludesTax": bool(hotel.get("priceIncludesTax")),
         "priceSource": hotel.get("priceSource") or "",
         "compareDates": compare_dates,
@@ -1325,7 +1334,7 @@ def search_deals(
     target = provider.resolve_target_hotel(city=city, hotel_name=target_hotel_name, target_hint=target_hint)
     selected_value = selected.isoformat()
     streaming_nearby_hotels: list[dict[str, Any]] = []
-    last_candidate_snapshot_signature: tuple[tuple[str, str, str, str], ...] = ()
+    last_candidate_snapshot_signature: tuple[tuple[str, str, str, str, str], ...] = ()
 
     def publish_current_candidates(discovered_hotels: list[dict[str, Any]]) -> None:
         nonlocal streaming_nearby_hotels, last_candidate_snapshot_signature
@@ -1340,6 +1349,7 @@ def search_deals(
             (
                 str(hotel.get("hotelId") or hotel.get("hotelName") or ""),
                 str(hotel_price_for_selected_date(hotel, selected_value) or ""),
+                str(hotel.get("visiblePrice") or ""),
                 str(hotel.get("hotelName") or ""),
                 str(hotel.get("hotelOriginalName") or ""),
             )

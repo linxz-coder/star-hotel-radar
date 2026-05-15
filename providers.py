@@ -707,6 +707,8 @@ class TripComProvider:
     def _hotel_price_matches_date(self, hotel: dict[str, Any], selected_date: str) -> bool:
         if hotel.get("currentPrice") in (None, ""):
             return False
+        if hotel.get("priceIncludesTax") is False:
+            return False
         price_date = str(hotel.get("priceDate") or hotel.get("selectedDate") or "").strip()
         return not price_date or price_date == selected_date
 
@@ -915,7 +917,8 @@ class TripComProvider:
                 if not hotel_id:
                     continue
                 self._candidate_cache[hotel_id] = hotel
-                self._store_price_if_available(hotel_id, date_value, hotel.get("currentPrice"))
+                if self._hotel_price_matches_date(hotel, date_value):
+                    self._store_price_if_available(hotel_id, date_value, hotel.get("currentPrice"))
             still_missing = [
                 str(hotel_id)
                 for hotel_id in hotel_ids
@@ -980,7 +983,8 @@ class TripComProvider:
                     if not hotel_id:
                         continue
                     self._candidate_cache[hotel_id] = hotel
-                    self._store_price_if_available(hotel_id, date_value, hotel.get("currentPrice"))
+                    if self._hotel_price_matches_date(hotel, date_value):
+                        self._store_price_if_available(hotel_id, date_value, hotel.get("currentPrice"))
 
             if progress_callback:
                 self._publish_price_progress(
@@ -2276,7 +2280,13 @@ Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
             return candidate_has_tax
         candidate_price = int(candidate.get("currentPrice") or 10**9)
         current_price = int(current.get("currentPrice") or 10**9)
-        return candidate_price < current_price
+        if candidate_price != current_price:
+            return candidate_price < current_price
+        candidate_visible_price = int(candidate.get("visiblePrice") or 10**9)
+        current_visible_price = int(current.get("visiblePrice") or 10**9)
+        if candidate_visible_price != current_visible_price:
+            return candidate_visible_price < current_visible_price
+        return bool(candidate.get("imageUrl")) and not bool(current.get("imageUrl"))
 
     def _dedupe_hotel_items(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return self._merge_hotel_lists([], items)
@@ -2301,6 +2311,7 @@ Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
                 (
                     str(item.get("hotelId") or item.get("hotelName") or ""),
                     str(item.get("currentPrice") or ""),
+                    str(item.get("visiblePrice") or ""),
                     str(item.get("priceIncludesTax") or ""),
                 )
                 for item in deduped
@@ -2513,7 +2524,9 @@ Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
             card = html_lib.unescape(card_body)
             name_match = re.search(r'<span class="hotelName">(.+?)</span>', card, flags=re.DOTALL)
             raw_name = self._strip_html(name_match.group(1)) if name_match else ""
-            price = self._extract_html_card_price(card)
+            price, price_includes_tax = self._extract_html_card_price_info(card)
+            visible_price = price if price is not None and not price_includes_tax else None
+            current_price = price if price is not None and price_includes_tax else None
             if not raw_name:
                 continue
             name_payload = hotel_name_payload_from_sources(
@@ -2538,10 +2551,17 @@ Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
                     "latitude": None,
                     "longitude": None,
                     "distanceKm": self._extract_html_card_distance(card),
-                    "currentPrice": price,
-                    "priceDate": check_in.isoformat() if price is not None else "",
-                    "priceIncludesTax": price is not None,
-                    "priceSource": "Trip.com card total incl. taxes & fees" if price is not None else "",
+                    "currentPrice": current_price,
+                    "visiblePrice": visible_price,
+                    "visiblePriceDate": check_in.isoformat() if visible_price is not None else "",
+                    "currentPricePreview": visible_price,
+                    "priceDate": check_in.isoformat() if current_price is not None else "",
+                    "priceIncludesTax": price_includes_tax,
+                    "priceSource": (
+                        "Trip.com card total incl. taxes & fees"
+                        if current_price is not None
+                        else ("Trip.com card visible price, tax pending" if visible_price is not None else "")
+                    ),
                     "imageUrl": self._extract_html_card_image(card),
                     "tripUrl": self._detail_url(str(hotel_id), city_id, check_in, check_out),
                     "rating": self._extract_html_card_rating(card),
@@ -2554,16 +2574,21 @@ Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
     def _strip_html(self, value: str) -> str:
         return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", html_lib.unescape(str(value or "")))).strip()
 
-    def _extract_html_card_price(self, card: str) -> int | None:
+    def _extract_html_card_price_info(self, card: str) -> tuple[int | None, bool]:
         tax_match = re.search(
             r"Total\s*\(incl\.\s*taxes\s*&\s*fees\):\s*CNY\s*([\d,]+)",
             card,
             flags=re.IGNORECASE,
         )
         if tax_match:
-            return int(tax_match.group(1).replace(",", ""))
+            return int(tax_match.group(1).replace(",", "")), True
         sale_match = re.search(r"(?:Current price\s*)?CNY\s*([\d,]+)", card, flags=re.IGNORECASE)
-        return int(sale_match.group(1).replace(",", "")) if sale_match else None
+        if sale_match:
+            return int(sale_match.group(1).replace(",", "")), False
+        return None, False
+
+    def _extract_html_card_price(self, card: str) -> int | None:
+        return self._extract_html_card_price_info(card)[0]
 
     def _extract_html_card_star(self, card: str) -> float:
         match = re.search(r'aria-label="([1-5](?:\.\d+)?)\s*out of 5 stars"', card, flags=re.IGNORECASE)
@@ -2676,6 +2701,8 @@ Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
         detected = detectHotelBrand(hotel_name) or {}
         city_id = position.get("cityId") or target.get("cityId") or 0
         trip_url = self._detail_url(hotel_id, city_id, check_in, check_out)
+        current_price = price if price is not None and price_includes_tax else None
+        visible_price = price if price is not None and not price_includes_tax else None
         return {
             "hotelId": hotel_id,
             "hotelName": hotel_name,
@@ -2689,10 +2716,17 @@ Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
             "starRating": self._extract_star(row),
             "latitude": coordinates[0],
             "longitude": coordinates[1],
-            "currentPrice": price,
-            "priceDate": check_in.isoformat() if price is not None else "",
-            "priceIncludesTax": bool(price is not None and price_includes_tax),
-            "priceSource": ("Trip.com tax-inclusive field" if price_includes_tax else "Trip.com base price field") if price is not None else "",
+            "currentPrice": current_price,
+            "visiblePrice": visible_price,
+            "visiblePriceDate": check_in.isoformat() if visible_price is not None else "",
+            "currentPricePreview": visible_price,
+            "priceDate": check_in.isoformat() if current_price is not None else "",
+            "priceIncludesTax": bool(current_price is not None and price_includes_tax),
+            "priceSource": (
+                "Trip.com tax-inclusive field"
+                if current_price is not None
+                else ("Trip.com base price field, tax pending" if visible_price is not None else "")
+            ),
             "imageUrl": self._extract_image_url(row),
             "tripUrl": trip_url,
             "rating": self._extract_rating(row),

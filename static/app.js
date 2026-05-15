@@ -208,9 +208,14 @@ function nameVerificationBar(hotel) {
 function pricePendingBar(hotel) {
   if (!hotel.pricePending) return "";
   const stillSearching = Boolean(latestData?.summary?.partial || latestData?.summary?.refreshing);
-  const text = stillSearching
-    ? "正在继续查询该酒店目标日期含税价，查到后会自动刷新"
-    : "本轮未拿到该酒店目标日期含税价，已保留为待补价候选";
+  const hasVisiblePrice = hotel.visiblePrice !== null && hotel.visiblePrice !== undefined && hotel.visiblePrice !== "";
+  const text = hasVisiblePrice
+    ? (stillSearching
+      ? `已先拿到列表参考价 ${currency(hotel.visiblePrice)}，正在核验含税总价`
+      : `Trip.com 列表参考价 ${currency(hotel.visiblePrice)}，本轮未核验到含税总价`)
+    : (stillSearching
+      ? "正在继续查询该酒店目标日期含税价，查到后会自动刷新"
+      : "本轮未拿到该酒店目标日期含税价，已保留为待补价候选");
   return `
     <div class="price-pending-bar">
       <span>${escapeHtml(text)}</span>
@@ -237,6 +242,11 @@ function hotelCard(hotel, mode) {
   const hotelName = displayHotelName(hotel);
   const referenceLabel = hotel.referencePriceLabel || "平时参考价";
   const referencePrice = hotel.referencePrice ?? hotel.averageComparePrice;
+  const hasVisiblePrice = hotel.visiblePrice !== null && hotel.visiblePrice !== undefined && hotel.visiblePrice !== "";
+  const targetPriceText = hotel.pricePending
+    ? (hasVisiblePrice ? `约 ${currency(hotel.visiblePrice)}` : "待补价")
+    : currency(hotel.currentPrice);
+  const targetPriceHint = hotel.pricePending && hasVisiblePrice ? `<em>待核验含税价</em>` : "";
   const hasPercent = hotel.discountPercent !== null && hotel.discountPercent !== undefined && hotel.discountPercent !== "";
   const percentValue = Number(hotel.discountPercent || 0);
   const discountLabel = deltaTone === "negative"
@@ -260,7 +270,8 @@ function hotelCard(hotel, mode) {
         <div class="price-grid">
           <div class="price-cell ${hotel.pricePending ? "price-cell--pending" : ""}">
             <span>目标日期价格</span>
-            <strong>${hotel.pricePending ? "待补价" : currency(hotel.currentPrice)}</strong>
+            <strong>${targetPriceText}</strong>
+            ${targetPriceHint}
           </div>
           <div class="price-cell">
             <span>${escapeHtml(referenceLabel)}</span>

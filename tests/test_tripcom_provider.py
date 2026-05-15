@@ -781,6 +781,33 @@ def test_html_list_parser_uses_total_tax_price_and_distance():
     assert filtered[0]["reviewCount"] == 3187
 
 
+def test_html_list_parser_keeps_visible_price_pending_when_tax_missing():
+    provider = TripComProvider()
+    html = """
+    <div class="list-item"><div class="hotel-card" id="40365204">
+      <span class="hotelName">深圳国际会展中心希尔顿花园酒店</span>
+      <div class="hotelStar" aria-label="4 out of 5 stars"></div>
+      <span class="position-desc">2.3 km from Shenzhen World Exhibition &amp; Convention Center</span>
+      <div>CNY 309</div>
+    </div></div>
+    """
+    target = {**target_hotel(), "hotelId": "landmark", "hotelName": "深圳国际会展中心"}
+
+    hotels = provider._hotel_cards_from_html(html, dt.date(2026, 6, 1), dt.date(2026, 6, 2), target)
+    filtered = provider._filter_nearby_hotels(
+        hotels=hotels,
+        target_hotel=target,
+        radius_km=5,
+        min_star=4,
+        selected_date="2026-06-01",
+    )
+
+    assert filtered[0]["currentPrice"] is None
+    assert filtered[0]["visiblePrice"] == 309
+    assert filtered[0]["priceIncludesTax"] is False
+    assert provider.get_cached_hotel_prices(["40365204"], ["2026-06-01"])["40365204"] == {}
+
+
 def test_html_list_parser_keeps_star_hotel_without_price():
     provider = TripComProvider()
     html = """
@@ -833,6 +860,32 @@ def test_trip_hotel_normalizer_keeps_star_hotel_without_price():
     assert item["currentPrice"] is None
     assert item["priceDate"] == ""
     assert item["priceIncludesTax"] is False
+
+
+def test_trip_hotel_normalizer_keeps_base_price_as_visible_preview():
+    provider = TripComProvider()
+    row = {
+        "hotelBasicInfo": {
+            "hotelId": "40365204",
+            "hotelName": "深圳国际会展中心希尔顿花园酒店",
+            "star": "4",
+            "price": 309,
+        },
+        "positionInfo": {
+            "cityName": "深圳",
+            "cityId": 30,
+            "lat": 22.664,
+            "lng": 113.781,
+        },
+    }
+
+    item = provider._normalize_trip_hotel(row, dt.date(2026, 6, 1), dt.date(2026, 6, 2), target_hotel())
+
+    assert item is not None
+    assert item["currentPrice"] is None
+    assert item["visiblePrice"] == 309
+    assert item["priceIncludesTax"] is False
+    assert item["priceSource"] == "Trip.com base price field, tax pending"
 
 
 def test_html_distance_parser_accepts_drive_distance():
