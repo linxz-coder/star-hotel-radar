@@ -391,6 +391,8 @@ select:focus {
 .alert,
 .loading,
 .compare-notice,
+.result-state,
+.cache-status,
 .price-status {
   border-radius: 8px;
   padding: 12px 14px;
@@ -410,6 +412,33 @@ select:focus {
   border: 1px solid #cadfff;
 }
 
+.result-state {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: #184267;
+  background: #eef8fb;
+  border: 1px solid #bfe3ee;
+}
+
+.result-state strong {
+  flex: 0 0 auto;
+  color: #075985;
+  font-size: 14px;
+  font-weight: 860;
+}
+
+.result-state span {
+  min-width: 0;
+  color: #31536f;
+  line-height: 1.45;
+}
+
+.result-state--found-incomplete {
+  background: #effaf7;
+  border-color: #bce4d7;
+}
+
 .compare-notice {
   color: #7a4a00;
   background: #fff8e6;
@@ -422,6 +451,67 @@ select:focus {
   background: #f0f6ff;
   border: 1px solid #c8dcff;
   font-weight: 760;
+}
+
+.cache-status {
+  display: grid;
+  gap: 9px;
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid var(--line);
+}
+
+.cache-status-title {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 820;
+}
+
+.cache-layer-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.cache-layer {
+  display: inline-grid;
+  grid-template-columns: auto auto;
+  gap: 4px 8px;
+  align-items: center;
+  min-height: 32px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #f8fafc;
+  padding: 6px 9px;
+}
+
+.cache-layer span {
+  color: #536579;
+  font-size: 12px;
+  font-weight: 760;
+}
+
+.cache-layer strong {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 840;
+}
+
+.cache-layer em {
+  grid-column: 1 / -1;
+  color: var(--muted);
+  font-size: 11px;
+  font-style: normal;
+  line-height: 1.35;
+}
+
+.cache-layer--hit {
+  border-color: #addcca;
+  background: #effaf7;
+}
+
+.cache-layer--bypassed {
+  border-color: #ead39e;
+  background: #fff9eb;
 }
 
 .result-actions {
@@ -1169,6 +1259,16 @@ select:focus {
 
   .compare-tile strong {
     font-size: 13px;
+  }
+
+  .result-state {
+    align-items: flex-start;
+    gap: 5px;
+  }
+
+  .cache-layer-list {
+    display: grid;
+    grid-template-columns: 1fr;
   }
 
   .result-actions {

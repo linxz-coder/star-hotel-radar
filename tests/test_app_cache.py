@@ -1118,7 +1118,8 @@ def test_admin_status_reports_running_and_completed_jobs(monkeypatch, tmp_path):
     assert data["metrics"]["completedJobs"] == 1
     assert data["metrics"]["nameVerificationJobs"] == 1
     assert data["metrics"]["unpricedActiveHotels"] == 1
-    assert data["activeJobs"][0]["taskLabel"] == "核验中文名"
+    assert data["activeJobs"][0]["taskLabel"] == "已找到但未完成"
+    assert data["activeJobs"][0]["summary"]["foundButIncomplete"] is True
     assert data["activeJobs"][0]["summary"]["priceProgress"]["date"] == "2026-06-19"
     assert data["completedJobs"][0]["status"] == "complete"
     assert data["activities"][0]["event"] == "job-started"

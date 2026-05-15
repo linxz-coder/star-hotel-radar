@@ -733,6 +733,17 @@ def merge_known_price_cache(
                 price_map.setdefault(str(hotel_id), {})[str(date_value)] = price
 
 
+def provider_cache_layers(provider: Any) -> list[dict[str, Any]]:
+    getter = getattr(provider, "cache_layers", None)
+    if not callable(getter):
+        return []
+    try:
+        layers = getter()
+    except Exception:
+        return []
+    return [dict(layer) for layer in layers if isinstance(layer, dict)]
+
+
 def radius_attempts(radius_km: float) -> list[float]:
     attempts = [float(radius_km)]
     for fallback_radius in (5.0, 10.0):
@@ -1110,6 +1121,7 @@ def current_price_result_from_hotels(
             "radiusExpanded": effective_radius_km > float(radius_km),
             "partial": True,
             "jobStatus": "pricing",
+            "cacheLayers": provider_cache_layers(provider),
         },
     }
 
@@ -1283,6 +1295,7 @@ def search_result_from_price_map(
         "priceCompareComplete": not partial,
         "completedCompareDateCount": len(completed_compare_dates),
         "totalCompareDateCount": len(compare_dates),
+        "cacheLayers": provider_cache_layers(provider),
     }
     if partial:
         summary["partial"] = True

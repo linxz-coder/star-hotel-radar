@@ -42,6 +42,8 @@ LOCAL_PROVIDER = LocalJsonProvider(APP_DIR)
 SEARCH_CACHE: dict[str, tuple[float, dict[str, Any], float]] = {}
 SEARCH_JOBS: dict[str, dict[str, Any]] = {}
 SEARCH_JOB_LOCK = threading.Lock()
+SEARCH_EVENT_CONDITION = threading.Condition()
+SEARCH_EVENT_VERSION = 0
 SEARCH_ACTIVITY: list[dict[str, Any]] = []
 SEARCH_ACTIVITY_LOCK = threading.Lock()
 SEARCH_CACHE_DIR = APP_DIR / ".cache" / "search_cache"
@@ -659,6 +661,136 @@ def cache_ttl_seconds(provider_name: str) -> int:
     return 0
 
 
+def notify_search_update(job_id: str | None = None) -> None:
+    del job_id
+    global SEARCH_EVENT_VERSION
+    with SEARCH_EVENT_CONDITION:
+        SEARCH_EVENT_VERSION += 1
+        SEARCH_EVENT_CONDITION.notify_all()
+
+
+def cache_layer(
+    layer_type: str,
+    label: str,
+    *,
+    status: str,
+    source: str = "",
+    hit_count: int | None = None,
+    requested_count: int | None = None,
+    stored_count: int | None = None,
+    message: str = "",
+) -> dict[str, Any]:
+    layer: dict[str, Any] = {
+        "type": layer_type,
+        "label": label,
+        "status": status,
+        "source": source,
+    }
+    if hit_count is not None:
+        layer["hitCount"] = max(0, int(hit_count))
+    if requested_count is not None:
+        layer["requestedCount"] = max(0, int(requested_count))
+    if stored_count is not None:
+        layer["storedCount"] = max(0, int(stored_count))
+    if message:
+        layer["message"] = message
+    return layer
+
+
+def merge_cache_layers(*layer_sets: Any) -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for layers in layer_sets:
+        if not isinstance(layers, list):
+            continue
+        for raw_layer in layers:
+            if not isinstance(raw_layer, dict):
+                continue
+            layer_type = str(raw_layer.get("type") or raw_layer.get("label") or "").strip()
+            if not layer_type:
+                continue
+            layer = dict(raw_layer)
+            existing = merged.get(layer_type)
+            if existing is None:
+                merged[layer_type] = layer
+                order.append(layer_type)
+                continue
+            for key in ("hitCount", "requestedCount", "storedCount"):
+                if key in layer:
+                    existing[key] = max(int(existing.get(key) or 0), int(layer.get(key) or 0))
+            if layer.get("status") == "hit" or existing.get("status") not in {"hit", "bypassed"}:
+                existing["status"] = layer.get("status") or existing.get("status")
+            for key in ("label", "source", "message"):
+                if layer.get(key):
+                    existing[key] = layer[key]
+    return [merged[key] for key in order]
+
+
+def search_cache_layer(cache_source: str, cache_age_seconds: float | int | None = None) -> dict[str, Any]:
+    source_label = {
+        "memory": "内存",
+        "disk": "本地磁盘",
+        "mysql": "MySQL",
+    }.get(cache_source, cache_source or "搜索缓存")
+    message = f"{source_label}搜索结果缓存命中"
+    if cache_age_seconds is not None:
+        message += f"，约 {round(float(cache_age_seconds))} 秒前更新"
+    return cache_layer(
+        "searchResult",
+        "整页搜索结果",
+        status="hit",
+        source=source_label,
+        hit_count=1,
+        message=message,
+    )
+
+
+def merged_search_cache_layer(carried_count: int = 0, corrected_count: int = 0) -> dict[str, Any]:
+    total = max(0, int(carried_count or 0) + int(corrected_count or 0))
+    return cache_layer(
+        "mergedSearchResult",
+        "旧搜索结果合并",
+        status="hit" if total else "miss",
+        source="搜索缓存",
+        hit_count=total,
+        message=f"后台实时搜索已合并旧缓存结果，保留/修正 {total} 家酒店。" if total else "",
+    )
+
+
+def result_state_from_summary(result: dict[str, Any]) -> tuple[str, str, str]:
+    summary = result.get("summary") if isinstance(result.get("summary"), dict) else {}
+    candidate_count = safe_int(summary.get("candidateCount") or len(result.get("allHotels") or []))
+    priced_count = safe_int(summary.get("pricedHotelCount"))
+    unpriced_count = safe_int(summary.get("unpricedCandidateCount"))
+    partial = bool(summary.get("partial") or summary.get("refreshing"))
+    price_incomplete = summary.get("priceCompareComplete") is False or unpriced_count > 0
+    name_incomplete = bool(summary.get("nameVerificationActive")) or safe_int(summary.get("nameVerificationRemainingCount")) > 0
+    if candidate_count > 0 and (partial or price_incomplete or name_incomplete):
+        parts = [f"已找到 {candidate_count} 家候选"]
+        if priced_count:
+            parts.append(f"{priced_count} 家已有含税价")
+        if unpriced_count:
+            parts.append(f"{unpriced_count} 家待补价")
+        if name_incomplete:
+            parts.append("中文名仍在核验")
+        return "found-incomplete", "已找到但未完成", "，".join(parts)
+    if candidate_count > 0:
+        return "complete", "结果已完成", f"已完成 {candidate_count} 家候选酒店整理"
+    if partial:
+        return "searching", "正在搜索", "正在匹配目标位置和附近星级酒店"
+    return "empty", "暂无结果", ""
+
+
+def annotate_result_runtime_state(result: dict[str, Any]) -> dict[str, Any]:
+    summary = result.setdefault("summary", {})
+    state, label, message = result_state_from_summary(result)
+    summary["resultState"] = state
+    summary["resultStateLabel"] = label
+    summary["resultStateMessage"] = message
+    summary["foundButIncomplete"] = state == "found-incomplete"
+    return result
+
+
 def apply_sort_to_result(result: dict[str, Any], sort_by: str) -> dict[str, Any]:
     data = copy.deepcopy(result)
     data.setdefault("query", {})["sortBy"] = sort_by
@@ -706,7 +838,7 @@ def apply_sort_to_result(result: dict[str, Any], sort_by: str) -> dict[str, Any]
     summary["unpricedCandidateCount"] = sum(1 for hotel in data["allHotels"] if hotel.get("currentPrice") in (None, ""))
     summary["dealCount"] = len(data["dealHotels"])
     summary["recommendedCount"] = len(data["recommendedHotels"])
-    return data
+    return annotate_result_runtime_state(data)
 
 
 def cached_search_result(key: str, provider_name: str, sort_by: str) -> dict[str, Any] | None:
@@ -761,6 +893,10 @@ def cached_search_result(key: str, provider_name: str, sort_by: str) -> dict[str
     data["summary"]["elapsedMs"] = 0
     data["summary"]["cacheUpdatedAt"] = updated_at or None
     data["summary"]["cacheAgeSeconds"] = cache_age_seconds
+    data["summary"]["cacheLayers"] = merge_cache_layers(
+        [search_cache_layer(cache_source, cache_age_seconds)],
+        data["summary"].get("cacheLayers"),
+    )
     return data
 
 
@@ -1210,6 +1346,10 @@ def merge_search_result_with_cached(fresh_result: dict[str, Any], cached_result:
     summary["cacheCarriedHotelCount"] = carried_count
     summary["cacheCorrectedHotelCount"] = corrected_count
     summary["cacheMergedHotelCount"] = carried_count + corrected_count
+    summary["cacheLayers"] = merge_cache_layers(
+        summary.get("cacheLayers"),
+        [merged_search_cache_layer(carried_count, corrected_count)],
+    )
     return data
 
 
@@ -1489,6 +1629,11 @@ def remember_search_result(key: str, provider_name: str, result: dict[str, Any])
     stored["summary"].pop("cacheSource", None)
     stored["summary"].pop("cacheAgeSeconds", None)
     stored["summary"].pop("cacheUpdatedAt", None)
+    stored["summary"].pop("cacheLayers", None)
+    stored["summary"].pop("resultState", None)
+    stored["summary"].pop("resultStateLabel", None)
+    stored["summary"].pop("resultStateMessage", None)
+    stored["summary"].pop("foundButIncomplete", None)
     stored["summary"].pop("refreshing", None)
     stored["summary"].pop("refreshJobId", None)
     stored["summary"].pop("jobId", None)
@@ -1527,6 +1672,9 @@ def search_parameters(payload: dict[str, Any], provider_name: str | None = None)
 
 
 def configure_provider_runtime_cache(provider: Any, *, force_refresh: bool = False) -> None:
+    resetter = getattr(provider, "reset_cache_stats", None)
+    if callable(resetter):
+        resetter()
     setter = getattr(provider, "set_persistent_price_cache", None)
     if callable(setter):
         setter(
@@ -1548,7 +1696,7 @@ def run_search_payload(payload: dict[str, Any], provider_name: str, *, quick: bo
     provider = local_provider() if provider_name == "local" else provider_from_name(APP_DIR, provider_name)
     configure_provider_runtime_cache(provider, force_refresh=force_refresh_requested(payload))
     search_fn = search_current_prices if quick else search_deals
-    return search_fn(provider=provider, **params)
+    return annotate_result_runtime_state(search_fn(provider=provider, **params))
 
 
 def job_progress(stage: str, message: str, started_at: float | None = None) -> dict[str, Any]:
@@ -1624,13 +1772,17 @@ def update_pipeline_stages(
 
 
 def set_job_pipeline_stage(job_id: str, progress_stage: str, message: str, *, final: bool = False) -> list[dict[str, Any]]:
+    changed = False
     with SEARCH_JOB_LOCK:
         job = SEARCH_JOBS.get(job_id)
         if job is None:
             return update_pipeline_stages(None, progress_stage, message, final=final)
         stages = update_pipeline_stages(job.get("pipelineStages"), progress_stage, message, final=final)
         job["pipelineStages"] = stages
-        return copy.deepcopy(stages)
+        changed = True
+    if changed:
+        notify_search_update(job_id)
+    return copy.deepcopy(stages)
 
 
 def final_search_progress(result: dict[str, Any], started_at: float | None = None) -> dict[str, Any]:
@@ -1691,6 +1843,11 @@ def compact_result_summary(result: dict[str, Any] | None) -> dict[str, Any]:
         "nameVerificationRemainingCount": int(summary.get("nameVerificationRemainingCount") or 0),
         "cacheHit": bool(summary.get("cacheHit")),
         "cacheSource": summary.get("cacheSource") or "",
+        "cacheLayers": summary.get("cacheLayers") if isinstance(summary.get("cacheLayers"), list) else [],
+        "resultState": summary.get("resultState") or "",
+        "resultStateLabel": summary.get("resultStateLabel") or "",
+        "resultStateMessage": summary.get("resultStateMessage") or "",
+        "foundButIncomplete": bool(summary.get("foundButIncomplete")),
         "source": summary.get("source") or "",
     }
 
@@ -1719,13 +1876,18 @@ def record_search_activity(
     with SEARCH_ACTIVITY_LOCK:
         SEARCH_ACTIVITY.insert(0, record)
         del SEARCH_ACTIVITY[MAX_SEARCH_ACTIVITY_ITEMS:]
+    notify_search_update(job_id or None)
 
 
 def update_search_job(job_id: str, **updates: Any) -> None:
+    changed = False
     with SEARCH_JOB_LOCK:
         job = SEARCH_JOBS.get(job_id)
         if job is not None:
             job.update(updates)
+            changed = True
+    if changed:
+        notify_search_update(job_id)
 
 
 def queued_search_result(payload: dict[str, Any], provider_name: str, job_id: str, started_at: float) -> dict[str, Any]:
@@ -1737,7 +1899,7 @@ def queued_search_result(payload: dict[str, Any], provider_name: str, job_id: st
         "搜索任务已启动，正在连接 Trip.com 并匹配目标酒店/位置。",
         started_at,
     )
-    return {
+    return annotate_result_runtime_state({
         "query": {
             "city": params["city"],
             "targetHotel": params["target_hotel_name"],
@@ -1783,7 +1945,7 @@ def queued_search_result(payload: dict[str, Any], provider_name: str, job_id: st
             "progress": progress,
             "pipelineStages": update_pipeline_stages(initial_pipeline_stages(), "queued", progress["message"]),
         },
-    }
+    })
 
 
 def job_id_for_key(key: str) -> str:
@@ -1853,6 +2015,7 @@ def start_background_search_job(
                 progress = job_progress(stage, message, SEARCH_JOBS[job_id]["startedAt"])
                 partial_summary["progress"] = progress
                 partial_summary["pipelineStages"] = set_job_pipeline_stage(job_id, stage, message)
+                partial_result = annotate_result_runtime_state(partial_result)
                 update_search_job(job_id, partialResult=partial_result, progress=progress)
                 if cacheable_search_result(partial_result):
                     remember_search_result(key, provider_name, partial_result)
@@ -1874,6 +2037,7 @@ def start_background_search_job(
                         partial_summary["jobStatus"] = "pricing"
                         if price_progress is not None:
                             partial_summary["priceProgress"] = price_progress
+                notify_search_update(job_id)
 
             update_search_job(
                 job_id,
@@ -2014,6 +2178,7 @@ def start_background_search_job(
                     partial_summary["nameVerificationActive"] = True
                     partial_summary["progress"] = progress
                     partial_summary["pipelineStages"] = set_job_pipeline_stage(job_id, "name-verification", message)
+                    partial_result = annotate_result_runtime_state(partial_result)
                     update_search_job(job_id, partialResult=partial_result, progress=progress)
                     if cacheable_search_result(partial_result):
                         remember_search_result(key, provider_name, partial_result)
@@ -2036,6 +2201,7 @@ def start_background_search_job(
                     "name-verification",
                     initial_name_progress["message"],
                 )
+                name_partial = annotate_result_runtime_state(name_partial)
                 update_search_job(job_id, partialResult=name_partial, progress=initial_name_progress)
                 name_verifier.wait_until_idle()
                 result = name_verifier.apply_to_result(result)
@@ -2087,6 +2253,7 @@ def start_background_search_job(
                     "missingHotelCount": int(result["summary"].get("unpricedCandidateCount") or 0),
                     "totalHotels": int(result["summary"].get("candidateCount") or len(result.get("allHotels") or []) or 0),
                 }
+            result = annotate_result_runtime_state(result)
             remember_search_result(key, provider_name, result)
             record_hot_search(payload)
             record_search_activity("job-complete", effective_payload, status="complete", job_id=job_id, result=result)
@@ -2101,6 +2268,7 @@ def start_background_search_job(
                         "pipelineStages": result["summary"]["pipelineStages"],
                     }
                 )
+            notify_search_update(job_id)
         except Exception as exc:  # pragma: no cover - exercised through integration
             if provider_name == "tripcom" and isinstance(exc, ProviderError) and retriable_provider_error(exc):
                 with SEARCH_JOB_LOCK:
@@ -2136,6 +2304,7 @@ def start_background_search_job(
                             "progress": progress,
                         }
                     )
+                notify_search_update(job_id)
 
                 def retry_worker() -> None:
                     time.sleep(max(1, CACHE_RETRY_DELAY_SECONDS))
@@ -2172,6 +2341,7 @@ def start_background_search_job(
                         "progress": progress,
                     }
                 )
+            notify_search_update(job_id)
             record_search_activity("job-error", effective_payload, status="error", job_id=job_id, result=partial_result if isinstance(partial_result, dict) else None, error=str(exc))
 
     threading.Thread(target=worker, name=f"hotel-search-{job_id}", daemon=True).start()
@@ -2335,6 +2505,11 @@ def admin_task_label(status: str, summary: dict[str, Any], progress: dict[str, A
         return "已完成"
     if status == "error":
         return "搜索失败"
+    if summary.get("foundButIncomplete") or (
+        safe_int(summary.get("candidateCount")) > 0
+        and (status == "running" or safe_int(summary.get("unpricedCandidateCount")) > 0)
+    ):
+        return "已找到但未完成"
     if stage == "waiting-retry":
         return "等待自动续搜"
     if stage == "name-verification" or summary.get("nameVerificationActive"):
@@ -2353,6 +2528,7 @@ def admin_task_label(status: str, summary: dict[str, Any], progress: dict[str, A
 def admin_job_item(job_id: str, job: dict[str, Any]) -> dict[str, Any]:
     result = job.get("result") if isinstance(job.get("result"), dict) else job.get("partialResult")
     result = result if isinstance(result, dict) else {}
+    result = annotate_result_runtime_state(copy.deepcopy(result)) if result else {}
     result_summary = result.get("summary") if isinstance(result.get("summary"), dict) else {}
     summary = compact_result_summary(result)
     progress = copy.deepcopy(job.get("progress") or result_summary.get("progress") or {})
@@ -2429,6 +2605,13 @@ def recent_disk_cache_items(limit: int = 12) -> list[dict[str, Any]]:
         if not result:
             continue
         updated_at = safe_float(record.get("updatedAt") or record.get("createdAt") or path.stat().st_mtime)
+        cache_age_seconds = max(0, round(time.time() - updated_at, 1)) if updated_at else None
+        result = copy.deepcopy(result)
+        result_summary = result.setdefault("summary", {})
+        result_summary["cacheHit"] = True
+        result_summary["cacheSource"] = "disk"
+        result_summary["cacheLayers"] = [search_cache_layer("disk", cache_age_seconds)]
+        result = annotate_result_runtime_state(result)
         items.append(
             {
                 "jobId": f"cache:{path.stem[:10]}",
@@ -2668,6 +2851,7 @@ def search():
                         "已秒出缓存结果，正在后台刷新 Trip.com 实时价格。",
                         time.time(),
                     )
+                    cached = annotate_result_runtime_state(cached)
                 record_hot_search(payload)
                 record_search_activity("cache-hit", payload, status="cache-hit", result=cached)
                 return jsonify(cached)
@@ -2711,6 +2895,7 @@ def search():
         result = run_search_payload(payload, provider_name, quick=False)
         if force_refresh:
             result = merge_search_result_with_cached(result, cached)
+        result = annotate_result_runtime_state(result)
         result.setdefault("summary", {})["cacheHit"] = False
         result["summary"]["cacheSource"] = "live-refresh" if force_refresh else "live"
         result["summary"]["elapsedMs"] = round((time.perf_counter() - started_at) * 1000, 1)
@@ -2741,8 +2926,8 @@ def search_events(job_id: str):
 
     @stream_with_context
     def event_stream():
+        last_version = SEARCH_EVENT_VERSION
         last_signature = ""
-        last_keepalive = 0.0
         yield "retry: 1000\n\n"
         while True:
             payload, _status_code = search_job_snapshot(job_id, sort_by)
@@ -2752,13 +2937,48 @@ def search_events(job_id: str):
             if signature != last_signature:
                 yield sse_message(payload)
                 last_signature = signature
-                last_keepalive = time.time()
             if payload.get("status") in {"complete", "error", "missing"}:
                 break
-            if time.time() - last_keepalive >= 15:
+            with SEARCH_EVENT_CONDITION:
+                if SEARCH_EVENT_VERSION == last_version:
+                    SEARCH_EVENT_CONDITION.wait(timeout=15)
+                changed = SEARCH_EVENT_VERSION != last_version
+                last_version = SEARCH_EVENT_VERSION
+            if not changed:
                 yield ": keep-alive\n\n"
-                last_keepalive = time.time()
-            time.sleep(0.6)
+
+    return Response(
+        event_stream(),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/api/admin/events")
+def admin_events():
+    if not admin_request_authorized():
+        return jsonify({"error": "未授权"}), 401
+
+    @stream_with_context
+    def event_stream():
+        last_version = SEARCH_EVENT_VERSION
+        last_signature = ""
+        yield "retry: 1500\n\n"
+        while True:
+            payload = admin_status_payload()
+            signature = hashlib.sha256(
+                json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+            ).hexdigest()
+            if signature != last_signature:
+                yield sse_message(payload)
+                last_signature = signature
+            with SEARCH_EVENT_CONDITION:
+                if SEARCH_EVENT_VERSION == last_version:
+                    SEARCH_EVENT_CONDITION.wait(timeout=20)
+                changed = SEARCH_EVENT_VERSION != last_version
+                last_version = SEARCH_EVENT_VERSION
+            if not changed:
+                yield ": keep-alive\n\n"
 
     return Response(
         event_stream(),

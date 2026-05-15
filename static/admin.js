@@ -10,6 +10,8 @@ const refreshNowButton = document.getElementById("refresh-now");
 
 const adminToken = window.__ADMIN_TOKEN__ || "";
 let polling = false;
+let adminEventSource = null;
+let adminPollTimer = null;
 let lastPayload = null;
 
 function escapeHtml(value) {
@@ -54,6 +56,13 @@ function statusUrl() {
   if (adminToken) params.set("token", adminToken);
   const query = params.toString();
   return query ? `/api/admin/status?${query}` : "/api/admin/status";
+}
+
+function statusEventsUrl() {
+  const params = new URLSearchParams();
+  if (adminToken) params.set("token", adminToken);
+  const query = params.toString();
+  return query ? `/api/admin/events?${query}` : "/api/admin/events";
 }
 
 function queryTitle(query) {
@@ -135,7 +144,38 @@ function summaryChips(summary = {}) {
   if (summary.nameVerificationTotal) {
     chips.push(`<span>中文名 ${formatNumber(summary.nameVerificationResolvedCount)}/${formatNumber(summary.nameVerificationTotal)}</span>`);
   }
+  if (summary.foundButIncomplete || summary.resultState === "found-incomplete") {
+    chips.unshift(`<span class="warn">已找到但未完成</span>`);
+  }
   return chips.join("");
+}
+
+function cacheStatusText(layer = {}) {
+  const status = layer.status || (layer.hit ? "hit" : "miss");
+  const source = layer.source ? `${layer.source} ` : "";
+  const hitCount = Number(layer.hitCount || 0);
+  const requestedCount = Number(layer.requestedCount || 0);
+  const storedCount = Number(layer.storedCount || 0);
+  if (status === "hit") {
+    if (requestedCount) return `${source}命中 ${hitCount}/${requestedCount}`;
+    if (hitCount) return `${source}命中 ${hitCount} 条`;
+    return `${source}命中`;
+  }
+  if (status === "bypassed") return "已绕过";
+  if (storedCount) return `已更新 ${storedCount} 条`;
+  return "未命中";
+}
+
+function cacheLayersHtml(summary = {}) {
+  const layers = Array.isArray(summary.cacheLayers) ? summary.cacheLayers : [];
+  if (!layers.length) return "";
+  return `
+    <div class="cache-layer-mini">
+      ${layers.map((layer) => `
+        <span>${escapeHtml(layer.label || layer.type || "缓存")}：${escapeHtml(cacheStatusText(layer))}</span>
+      `).join("")}
+    </div>
+  `;
 }
 
 function progressHtml(percent) {
@@ -189,6 +229,7 @@ function jobCard(job) {
       ${pipelineHtml(job.pipelineStages)}
       <div class="job-message">${escapeHtml(message)}</div>
       <div class="summary-line">${summaryChips(summary)}</div>
+      ${cacheLayersHtml(summary)}
       <div class="job-meta">
         <span>已用时 ${escapeHtml(formatDuration(job.elapsedMs))}</span>
         <span>更新 ${escapeHtml(formatTime(job.updatedAtText))}</span>
@@ -220,6 +261,7 @@ function compactJobItem(job, fallbackStatus = "complete") {
         <span class="badge ${badgeClass(job.status || fallbackStatus)}">${escapeHtml(statusText(job.status || fallbackStatus))}</span>
       </div>
       <div class="summary-line">${summaryChips(summary)}</div>
+      ${cacheLayersHtml(summary)}
       <div class="activity-meta">
         ${escapeHtml(formatTime(job.updatedAtText))}｜用时 ${escapeHtml(formatDuration(job.elapsedMs))}
         ${job.error ? `｜${escapeHtml(job.error)}` : ""}
@@ -271,6 +313,7 @@ function renderActivities(activities = []) {
         ${escapeHtml(queryMeta(item.query))}｜${escapeHtml(formatTime(item.createdAtText))}
       </div>
       <div class="summary-line">${summaryChips(item.summary || {})}</div>
+      ${cacheLayersHtml(item.summary || {})}
       ${item.error ? `<div class="activity-meta">${escapeHtml(item.error)}</div>` : ""}
     </article>
   `).join("");
@@ -313,6 +356,17 @@ function renderAll(data) {
   refreshStateNode.textContent = `已刷新 ${formatTime(data.generatedAt)}`;
 }
 
+function scheduleFallbackPolling() {
+  if (adminPollTimer) return;
+  adminPollTimer = window.setInterval(refreshStatus, 5000);
+}
+
+function stopFallbackPolling() {
+  if (!adminPollTimer) return;
+  window.clearInterval(adminPollTimer);
+  adminPollTimer = null;
+}
+
 async function refreshStatus() {
   if (polling) return;
   polling = true;
@@ -337,5 +391,43 @@ async function refreshStatus() {
 }
 
 refreshNowButton.addEventListener("click", refreshStatus);
-refreshStatus();
-window.setInterval(refreshStatus, 2000);
+
+function startStatusEvents() {
+  refreshStatus();
+  if (typeof EventSource === "undefined") {
+    scheduleFallbackPolling();
+    return;
+  }
+  if (adminEventSource) adminEventSource.close();
+  const source = new EventSource(statusEventsUrl());
+  adminEventSource = source;
+  let receivedEvent = false;
+  const fallbackTimer = window.setTimeout(() => {
+    if (!receivedEvent && adminEventSource === source) {
+      source.close();
+      adminEventSource = null;
+      scheduleFallbackPolling();
+    }
+  }, 4000);
+
+  source.onmessage = (event) => {
+    receivedEvent = true;
+    window.clearTimeout(fallbackTimer);
+    stopFallbackPolling();
+    try {
+      renderAll(JSON.parse(event.data));
+    } catch (error) {
+      refreshStateNode.textContent = "后台推送数据解析失败，已切换为手动刷新";
+    }
+  };
+
+  source.onerror = () => {
+    window.clearTimeout(fallbackTimer);
+    if (adminEventSource !== source) return;
+    source.close();
+    adminEventSource = null;
+    scheduleFallbackPolling();
+  };
+}
+
+startStatusEvents();

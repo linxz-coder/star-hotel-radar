@@ -236,6 +236,7 @@ class TripComProvider:
         self._last_search_targets: list[dict[str, Any]] = []
         self._candidate_cache: dict[str, dict[str, Any]] = {}
         self._price_cache: dict[str, dict[str, int | None]] = {}
+        self._cache_stats: dict[str, dict[str, Any]] = {}
         self._persistent_price_cache: Any | None = None
         self._persistent_candidate_cache: Any | None = None
         self._bypass_persistent_price_cache = False
@@ -246,6 +247,42 @@ class TripComProvider:
         self._persistent_candidate_cache_ttl_seconds = float(
             os.environ.get("HOTEL_DEAL_HOTEL_CANDIDATE_CACHE_TTL_SECONDS", str(30 * 24 * 60 * 60))
         )
+        self.reset_cache_stats()
+
+    def reset_cache_stats(self) -> None:
+        self._cache_stats = {
+            "candidateMetadata": {
+                "label": "候选酒店元数据",
+                "type": "candidateMetadata",
+                "enabled": False,
+                "bypassed": False,
+                "hit": False,
+                "hitCount": 0,
+                "storedCount": 0,
+                "source": "MySQL",
+            },
+            "hotelPrice": {
+                "label": "酒店日期含税价",
+                "type": "hotelPrice",
+                "enabled": False,
+                "bypassed": False,
+                "hit": False,
+                "hitCount": 0,
+                "requestedCount": 0,
+                "storedCount": 0,
+                "source": "MySQL",
+            },
+        }
+
+    def cache_layers(self) -> list[dict[str, Any]]:
+        layers: list[dict[str, Any]] = []
+        for key in ("candidateMetadata", "hotelPrice"):
+            layer = dict(self._cache_stats.get(key) or {})
+            if not layer:
+                continue
+            layer["status"] = "hit" if layer.get("hit") else ("bypassed" if layer.get("bypassed") else "miss")
+            layers.append(layer)
+        return layers
 
     def set_persistent_price_cache(
         self,
@@ -258,6 +295,9 @@ class TripComProvider:
         self._bypass_persistent_price_cache = bool(bypass)
         if ttl_seconds is not None:
             self._persistent_price_cache_ttl_seconds = float(ttl_seconds)
+        layer = self._cache_stats.setdefault("hotelPrice", {})
+        layer["enabled"] = price_cache is not None and self._persistent_price_cache_ttl_seconds > 0
+        layer["bypassed"] = bool(bypass)
 
     def set_persistent_candidate_cache(
         self,
@@ -270,6 +310,9 @@ class TripComProvider:
         self._bypass_persistent_candidate_cache = bool(bypass)
         if ttl_seconds is not None:
             self._persistent_candidate_cache_ttl_seconds = float(ttl_seconds)
+        layer = self._cache_stats.setdefault("candidateMetadata", {})
+        layer["enabled"] = candidate_cache is not None and self._persistent_candidate_cache_ttl_seconds > 0
+        layer["bypassed"] = bool(bypass)
 
     def _persistent_candidate_cache_available(self) -> bool:
         return bool(
@@ -358,8 +401,14 @@ class TripComProvider:
         except Exception:
             return []
         hotels = [self._candidate_metadata_for_date(row, selected_date) for row in rows if isinstance(row, dict)]
+        if hotels:
+            layer = self._cache_stats.setdefault("candidateMetadata", {})
+            layer["hit"] = True
+            layer["hitCount"] = int(layer.get("hitCount") or 0) + len(hotels)
+            layer["targetName"] = str(target_hotel.get("hotelName") or "")
         for hotel in hotels:
             hotel_id = str(hotel.get("hotelId") or "")
+            hotel["candidateMetadataCacheHit"] = True
             if hotel_id:
                 self._candidate_cache[hotel_id] = hotel
         return hotels
@@ -377,6 +426,8 @@ class TripComProvider:
         rows = [self._candidate_metadata_payload(hotel) for hotel in hotels if hotel.get("hotelId")]
         if not rows:
             return
+        layer = self._cache_stats.setdefault("candidateMetadata", {})
+        layer["storedCount"] = max(int(layer.get("storedCount") or 0), len(rows))
         try:
             self._persistent_candidate_cache.store(
                 self.source_name,
@@ -941,6 +992,8 @@ class TripComProvider:
         if price not in (None, ""):
             hotel_id_str = str(hotel_id)
             self._price_cache.setdefault(hotel_id_str, {})[date_value] = price
+            layer = self._cache_stats.setdefault("hotelPrice", {})
+            layer["storedCount"] = int(layer.get("storedCount") or 0) + 1
             if self._persistent_price_cache_available(write=True):
                 try:
                     self._persistent_price_cache.store_price(
@@ -974,6 +1027,9 @@ class TripComProvider:
         ]
         if not missing_hotel_ids:
             return
+        requested_count = len(missing_hotel_ids) * len([date for date in dates if str(date or "").strip()])
+        layer = self._cache_stats.setdefault("hotelPrice", {})
+        layer["requestedCount"] = int(layer.get("requestedCount") or 0) + requested_count
         try:
             cached_prices = self._persistent_price_cache.get_many(
                 self.source_name,
@@ -985,12 +1041,17 @@ class TripComProvider:
             return
         if not isinstance(cached_prices, dict):
             return
+        hit_count = 0
         for hotel_id, prices in cached_prices.items():
             if not isinstance(prices, dict):
                 continue
             for date_value, price in prices.items():
                 if price not in (None, ""):
                     self._price_cache.setdefault(str(hotel_id), {})[str(date_value)] = int(price)
+                    hit_count += 1
+        if hit_count:
+            layer["hit"] = True
+            layer["hitCount"] = int(layer.get("hitCount") or 0) + hit_count
 
     def _resolved_name_payload_from_sources(
         self,

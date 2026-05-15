@@ -2,6 +2,8 @@ const form = document.getElementById("search-form");
 const submitBtn = document.getElementById("submit-btn");
 const errorBox = document.getElementById("error-box");
 const loadingBox = document.getElementById("loading-box");
+const resultStateBox = document.getElementById("result-state-box");
+const cacheStatusBox = document.getElementById("cache-status-box");
 const priceStatusBox = document.getElementById("price-status-box");
 const exportPdfBtn = document.getElementById("export-pdf-btn");
 const exportPdfHint = document.getElementById("export-pdf-hint");
@@ -406,6 +408,99 @@ function setPriceStatus(summary = {}) {
   priceStatusBox.classList.toggle("hidden", !text);
 }
 
+function computedResultState(summary = {}) {
+  const candidateTotal = Number(summary.candidateCount || 0);
+  const pricedTotal = Number(summary.pricedHotelCount || 0);
+  const unpricedTotal = Number(summary.unpricedCandidateCount || 0);
+  if (summary.resultState) {
+    return {
+      state: summary.resultState,
+      label: summary.resultStateLabel || "",
+      message: summary.resultStateMessage || "",
+    };
+  }
+  if (candidateTotal > 0 && (summary.partial || summary.refreshing || unpricedTotal > 0 || summary.nameVerificationActive)) {
+    const parts = [`已找到 ${candidateTotal} 家候选`];
+    if (pricedTotal) parts.push(`${pricedTotal} 家已有含税价`);
+    if (unpricedTotal) parts.push(`${unpricedTotal} 家待补价`);
+    if (summary.nameVerificationActive) parts.push("中文名仍在核验");
+    return {state: "found-incomplete", label: "已找到但未完成", message: parts.join("，")};
+  }
+  if (summary.partial || summary.refreshing) return {state: "searching", label: "正在搜索", message: "正在匹配附近星级酒店"};
+  if (candidateTotal > 0) return {state: "complete", label: "结果已完成", message: `已完成 ${candidateTotal} 家候选酒店整理`};
+  return {state: "empty", label: "", message: ""};
+}
+
+function setResultState(summary = {}) {
+  if (!resultStateBox) return;
+  const state = computedResultState(summary);
+  const shouldShow = state.state === "found-incomplete" || state.state === "searching";
+  if (!shouldShow) {
+    resultStateBox.className = "result-state hidden";
+    resultStateBox.innerHTML = "";
+    return;
+  }
+  resultStateBox.className = `result-state result-state--${escapeHtml(state.state)}`;
+  resultStateBox.innerHTML = `
+    <strong>${escapeHtml(state.label || "搜索中")}</strong>
+    <span>${escapeHtml(state.message || "结果会随着后台进度继续刷新。")}</span>
+  `;
+}
+
+function cacheStatusText(layer = {}) {
+  const status = layer.status || (layer.hit ? "hit" : "miss");
+  const source = layer.source ? `${layer.source} ` : "";
+  const hitCount = Number(layer.hitCount || 0);
+  const requestedCount = Number(layer.requestedCount || 0);
+  const storedCount = Number(layer.storedCount || 0);
+  if (status === "hit") {
+    if (requestedCount) return `${source}命中 ${hitCount}/${requestedCount}`;
+    if (hitCount) return `${source}命中 ${hitCount} 条`;
+    return `${source}命中`;
+  }
+  if (status === "bypassed") return "已绕过";
+  if (storedCount) return `已更新 ${storedCount} 条`;
+  return "未命中";
+}
+
+function cacheLayerClass(layer = {}) {
+  const status = layer.status || (layer.hit ? "hit" : "miss");
+  if (status === "hit") return "cache-layer--hit";
+  if (status === "bypassed") return "cache-layer--bypassed";
+  return "cache-layer--miss";
+}
+
+function setCacheStatus(summary = {}) {
+  if (!cacheStatusBox) return;
+  const layers = Array.isArray(summary.cacheLayers) ? summary.cacheLayers : [];
+  if (!layers.length && !summary.cacheHit && !summary.mergedFromCache) {
+    cacheStatusBox.classList.add("hidden");
+    cacheStatusBox.innerHTML = "";
+    return;
+  }
+  const renderedLayers = layers.length
+    ? layers
+    : [{
+        label: "整页搜索结果",
+        status: summary.cacheHit ? "hit" : "miss",
+        source: summary.cacheSource || "",
+        hitCount: summary.cacheHit ? 1 : 0,
+      }];
+  cacheStatusBox.innerHTML = `
+    <div class="cache-status-title">缓存命中分层</div>
+    <div class="cache-layer-list">
+      ${renderedLayers.map((layer) => `
+        <div class="cache-layer ${cacheLayerClass(layer)}">
+          <span>${escapeHtml(layer.label || layer.type || "缓存层")}</span>
+          <strong>${escapeHtml(cacheStatusText(layer))}</strong>
+          ${layer.message ? `<em>${escapeHtml(layer.message)}</em>` : ""}
+        </div>
+      `).join("")}
+    </div>
+  `;
+  cacheStatusBox.classList.remove("hidden");
+}
+
 function sortedHotels(items, mode, summary = {}) {
   const sectionSort = hotelFilters[mode]?.sort?.value || "distance";
   const sortBy = sectionSort || (form.elements.sortBy.value || "discount");
@@ -462,7 +557,10 @@ function runningMessage(data) {
   const summary = result.summary || {};
   const progress = data.progress || summary.progress || {};
   const message = progress.message || "后台仍在搜索 Trip.com，找到候选后会自动刷新。";
-  const parts = [message];
+  const state = computedResultState(summary);
+  const parts = [];
+  if (state.state === "found-incomplete") parts.push("已找到但未完成");
+  parts.push(message);
   const candidateCount = Number(summary.candidateCount || 0);
   if (candidateCount) parts.push(`已找到 ${candidateCount} 家候选`);
   const elapsed = formatElapsed(data.elapsedMs || progress.elapsedMs);
@@ -732,6 +830,8 @@ function renderResult(data) {
     ? `公众假期对比：${(data.compareDates || []).join("、") || "-"}`
     : ((data.compareDates || []).join("、") || "-");
   setCompareNotice(holidayNotice);
+  setResultState(summary);
+  setCacheStatus(summary);
   setPriceStatus(summary);
   const expanded = summary.radiusExpanded
     ? `｜已扩展至 ${Number(summary.effectiveRadiusKm).toFixed(0)}km`
@@ -744,7 +844,7 @@ function renderResult(data) {
     ? `｜已合并旧缓存${summary.cacheCarriedHotelCount ? `，补回 ${summary.cacheCarriedHotelCount} 家` : ""}`
     : "";
   const partialLabel = summary.partial
-    ? (progress.stage === "name-verification" ? "｜中文名核验中" : "｜已先返回候选，后台计算优惠中")
+    ? (summary.foundButIncomplete ? "｜已找到但未完成" : (progress.stage === "name-verification" ? "｜中文名核验中" : "｜已先返回候选，后台计算优惠中"))
     : "";
   const nameLabel = summary.nameVerificationActive ? "｜中文名正在同步更新" : "";
   const progressLabel = progress.message ? `｜${progress.message}` : "";
@@ -877,6 +977,8 @@ async function runSearch() {
   latestData = null;
   setExportState();
   setPriceStatus({});
+  setResultState({});
+  setCacheStatus({});
   setLoading(true, "搜索任务准备中...");
   try {
     const response = await fetch("/api/search", {
