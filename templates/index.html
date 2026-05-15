@@ -126,6 +126,30 @@
             <h2>适合捡漏的酒店</h2>
             <p>按便宜金额优先展示</p>
           </div>
+          <div class="hotel-filter" data-filter="deal" aria-label="捡漏酒店筛选">
+            <label class="filter-keyword">
+              <span>筛选</span>
+              <input id="deal-filter-keyword" type="search" placeholder="酒店名 / 品牌" autocomplete="off" />
+            </label>
+            <label class="filter-sort">
+              <span>排序</span>
+              <select id="deal-filter-sort">
+                <option value="discount" selected>优惠优先</option>
+                <option value="distance">距离优先</option>
+                <option value="price">价格优先</option>
+              </select>
+            </label>
+            <label class="filter-price">
+              <span>最低价</span>
+              <input id="deal-filter-min-price" type="number" inputmode="numeric" min="0" step="1" placeholder="不限" />
+            </label>
+            <label class="filter-price">
+              <span>最高价</span>
+              <input id="deal-filter-max-price" type="number" inputmode="numeric" min="0" step="1" placeholder="不限" />
+            </label>
+            <button id="deal-filter-reset" class="ghost-btn" type="button">重置</button>
+            <span class="filter-count" id="deal-filter-count">等待结果</span>
+          </div>
         </div>
         <div class="hotel-list" id="deal-list"></div>
       </section>

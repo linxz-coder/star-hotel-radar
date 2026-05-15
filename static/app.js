@@ -18,6 +18,14 @@ const dealList = document.getElementById("deal-list");
 const candidateList = document.getElementById("candidate-list");
 const recommendList = document.getElementById("recommend-list");
 const hotelFilters = {
+  deal: {
+    keyword: document.getElementById("deal-filter-keyword"),
+    sort: document.getElementById("deal-filter-sort"),
+    minPrice: document.getElementById("deal-filter-min-price"),
+    maxPrice: document.getElementById("deal-filter-max-price"),
+    reset: document.getElementById("deal-filter-reset"),
+    count: document.getElementById("deal-filter-count"),
+  },
   candidate: {
     keyword: document.getElementById("candidate-filter-keyword"),
     sort: document.getElementById("candidate-filter-sort"),
@@ -339,11 +347,8 @@ function setCompareNotice(text) {
 }
 
 function sortedHotels(items, mode, summary = {}) {
-  if (summary.sortDeferred && mode === "deal") return [...(items || [])];
   const sectionSort = hotelFilters[mode]?.sort?.value || "distance";
-  const sortBy = mode === "candidate" || mode === "recommend"
-    ? sectionSort
-    : (form.elements.sortBy.value || "discount");
+  const sortBy = sectionSort || (form.elements.sortBy.value || "discount");
   const hotels = [...(items || [])];
   const price = (hotel) => {
     if (hotel.currentPrice === null || hotel.currentPrice === undefined || hotel.currentPrice === "") {
@@ -605,15 +610,17 @@ function renderResult(data) {
   }
 
   const deals = chineseNamedHotels(sortedHotels(data.dealHotels, "deal", summary));
+  const filteredDeals = filterHotels(deals, "deal");
   const allCandidates = chineseNamedHotels(sortedHotels(data.allHotels, "candidate", summary));
   const candidates = filterHotels(allCandidates, "candidate");
   const allRecommended = chineseNamedHotels(sortedHotels(data.recommendedHotels, "recommend", summary));
   const recommended = filterHotels(allRecommended, "recommend");
+  updateHotelFilterCount("deal", filteredDeals.length, deals.length);
   updateHotelFilterCount("candidate", candidates.length, allCandidates.length);
   updateHotelFilterCount("recommend", recommended.length, allRecommended.length);
-  dealList.innerHTML = deals.length
-    ? deals.map((hotel) => hotelCard(hotel, "deal")).join("")
-    : emptyState(summary.partial ? (progress.message || "已先展示目标日期候选酒店，后台正在计算优惠力度。") : "当前筛选条件下没有便宜 100 元以上的酒店。");
+  dealList.innerHTML = filteredDeals.length
+    ? filteredDeals.map((hotel) => hotelCard(hotel, "deal")).join("")
+    : emptyState(deals.length ? "没有符合当前筛选的捡漏酒店，可重置关键词或价格范围。" : (summary.partial ? (progress.message || "已先展示目标日期候选酒店，后台正在计算优惠力度。") : "当前筛选条件下没有便宜 100 元以上的酒店。"));
   candidateList.innerHTML = candidates.length
     ? candidates.map((hotel) => hotelCard(hotel, "candidate")).join("")
     : emptyState(allCandidates.length ? "没有符合当前筛选的候选酒店，可重置关键词或价格范围。" : (summary.partial ? (progress.message || "正在抓取附近四星级以上酒店，请稍候。") : "当前筛选条件下没有抓到四星级以上附近酒店。"));
@@ -802,7 +809,7 @@ for (const [mode, controls] of Object.entries(hotelFilters)) {
   });
   controls.reset?.addEventListener("click", () => {
     if (controls.keyword) controls.keyword.value = "";
-    if (controls.sort) controls.sort.value = "distance";
+    if (controls.sort) controls.sort.value = mode === "deal" ? "discount" : "distance";
     if (controls.minPrice) controls.minPrice.value = "";
     if (controls.maxPrice) controls.maxPrice.value = "";
     if (latestData) renderResult(latestData);
