@@ -383,50 +383,68 @@ function setCompareNotice(text) {
 function priceStatusText(summary = {}) {
   const priceProgress = summary.priceProgress || {};
   const missing = Number(priceProgress.missingHotelCount ?? summary.unpricedCandidateCount ?? 0);
-  const priced = Number(priceProgress.pricedHotelCount ?? summary.pricedHotelCount ?? 0);
   const total = Number(priceProgress.totalHotels ?? summary.candidateCount ?? 0);
-  const dateValue = priceProgress.date || "";
-  if (summary.partial || summary.refreshing) {
-    if (total && Number.isFinite(missing) && missing > 0) {
-      const dateLabel = dateValue ? `${dateValue} ` : "";
-      return `正在补齐${dateLabel}酒店含税价：已匹配 ${Number.isFinite(priced) ? priced : 0}/${total} 家，仍有 ${missing} 家待补价。`;
-    }
-    if (total && Number.isFinite(priced) && priced > 0) {
-      return `正在补齐酒店含税价：已匹配 ${priced}/${total} 家，结果会继续刷新。`;
-    }
-  }
   if (!summary.partial && Number.isFinite(missing) && missing > 0) {
-    return `本轮搜索完成后仍有 ${missing}/${total || "若干"} 家酒店未拿到目标日期含税价，已保留为“待补价”候选；Trip.com 后续返回价格或重新实时搜索时会继续补齐。`;
+    return `仍有 ${missing}/${total || "若干"} 家酒店未拿到目标日期含税价，已保留在候选列表。`;
   }
   return "";
 }
 
 function setPriceStatus(summary = {}) {
   if (!priceStatusBox) return;
+  if (summary.partial || summary.refreshing || summary.foundButIncomplete) {
+    priceStatusBox.classList.add("hidden");
+    priceStatusBox.textContent = "";
+    return;
+  }
   const text = priceStatusText(summary);
   priceStatusBox.textContent = text;
   priceStatusBox.classList.toggle("hidden", !text);
+}
+
+function statusActionText(summary = {}) {
+  const progress = summary.progress || {};
+  const stage = progress.stage || summary.jobStatus || "";
+  const priceProgress = summary.priceProgress || {};
+  const unpricedTotal = Number(summary.unpricedCandidateCount || 0);
+  if (summary.nameVerificationActive || stage === "name-verification") return "中文名核验中";
+  if (!summary.partial && !summary.refreshing && unpricedTotal > 0) return "已保留待补价候选";
+  if (stage === "refresh") return "后台刷新实时价格";
+  if (stage === "first-screen") return "继续补充更多候选";
+  if (stage === "deep-current-price") return "深度搜索更多酒店";
+  if (stage === "partial-deals") return "更新优惠判断";
+  if (stage === "compare-price") {
+    const total = Number(priceProgress.totalHotels || summary.candidateCount || 0);
+    const priced = Number(priceProgress.pricedHotelCount || summary.pricedHotelCount || 0);
+    return total && Number.isFinite(priced) ? `补齐含税价 ${priced}/${total}` : "补齐对比日期价格";
+  }
+  if (stage === "waiting-retry") return "等待自动续搜";
+  if (stage === "current-price" || stage === "queued") return "匹配附近星级酒店";
+  return "";
 }
 
 function computedResultState(summary = {}) {
   const candidateTotal = Number(summary.candidateCount || 0);
   const pricedTotal = Number(summary.pricedHotelCount || 0);
   const unpricedTotal = Number(summary.unpricedCandidateCount || 0);
-  if (summary.resultState) {
+  const action = statusActionText(summary);
+  if (candidateTotal > 0 && (summary.partial || summary.refreshing || unpricedTotal > 0 || summary.nameVerificationActive)) {
+    const parts = [`${candidateTotal} 家候选`];
+    if (pricedTotal) parts.push(`${pricedTotal} 家已有含税价`);
+    if (unpricedTotal) parts.push(`${unpricedTotal} 家待补价`);
+    if (action) parts.push(action);
+    return {state: "found-incomplete", label: "已找到但未完成", message: parts.join("，")};
+  }
+  if (summary.resultState && summary.resultState !== "found-incomplete") {
     return {
       state: summary.resultState,
       label: summary.resultStateLabel || "",
       message: summary.resultStateMessage || "",
     };
   }
-  if (candidateTotal > 0 && (summary.partial || summary.refreshing || unpricedTotal > 0 || summary.nameVerificationActive)) {
-    const parts = [`已找到 ${candidateTotal} 家候选`];
-    if (pricedTotal) parts.push(`${pricedTotal} 家已有含税价`);
-    if (unpricedTotal) parts.push(`${unpricedTotal} 家待补价`);
-    if (summary.nameVerificationActive) parts.push("中文名仍在核验");
-    return {state: "found-incomplete", label: "已找到但未完成", message: parts.join("，")};
+  if (summary.partial || summary.refreshing) {
+    return {state: "searching", label: "正在搜索", message: action || "匹配附近星级酒店"};
   }
-  if (summary.partial || summary.refreshing) return {state: "searching", label: "正在搜索", message: "正在匹配附近星级酒店"};
   if (candidateTotal > 0) return {state: "complete", label: "结果已完成", message: `已完成 ${candidateTotal} 家候选酒店整理`};
   return {state: "empty", label: "", message: ""};
 }
@@ -473,13 +491,25 @@ function cacheLayerClass(layer = {}) {
 function setCacheStatus(summary = {}) {
   if (!cacheStatusBox) return;
   const layers = Array.isArray(summary.cacheLayers) ? summary.cacheLayers : [];
-  if (!layers.length && !summary.cacheHit && !summary.mergedFromCache) {
+  const visibleLayers = layers.filter((layer) => {
+    const status = layer.status || (layer.hit ? "hit" : "miss");
+    return status === "hit" || status === "bypassed";
+  });
+  if (!visibleLayers.length && !summary.cacheHit && !summary.mergedFromCache) {
     cacheStatusBox.classList.add("hidden");
     cacheStatusBox.innerHTML = "";
     return;
   }
-  const renderedLayers = layers.length
-    ? layers
+  const renderedLayers = visibleLayers.length
+    ? visibleLayers
+    : summary.mergedFromCache
+      ? [{
+          label: "旧搜索结果",
+          status: "hit",
+          source: "搜索缓存",
+          hitCount: Number(summary.cacheMergedHotelCount || summary.cacheCarriedHotelCount || 0),
+          message: summary.cacheCarriedHotelCount ? `补回 ${summary.cacheCarriedHotelCount} 家酒店` : "",
+        }]
     : [{
         label: "整页搜索结果",
         status: summary.cacheHit ? "hit" : "miss",
@@ -487,7 +517,7 @@ function setCacheStatus(summary = {}) {
         hitCount: summary.cacheHit ? 1 : 0,
       }];
   cacheStatusBox.innerHTML = `
-    <div class="cache-status-title">缓存命中分层</div>
+    <div class="cache-status-title">缓存</div>
     <div class="cache-layer-list">
       ${renderedLayers.map((layer) => `
         <div class="cache-layer ${cacheLayerClass(layer)}">
@@ -535,12 +565,12 @@ function sortedHotels(items, mode, summary = {}) {
   return hotels.sort((a, b) => discount(b) - discount(a) || price(a) - price(b));
 }
 
-function setLoading(isLoading, message = "") {
+function setLoading(isLoading, message = "", showMessage = true) {
   submitBtn.disabled = isLoading;
   submitBtn.textContent = isLoading ? "搜索中..." : "开始捡漏";
   if (message) loadingBox.textContent = message;
   else if (isLoading) loadingBox.textContent = "正在查询价格和计算优惠...";
-  loadingBox.classList.toggle("hidden", !isLoading);
+  loadingBox.classList.toggle("hidden", !isLoading || !showMessage);
 }
 
 function formatElapsed(ms) {
@@ -557,12 +587,7 @@ function runningMessage(data) {
   const summary = result.summary || {};
   const progress = data.progress || summary.progress || {};
   const message = progress.message || "后台仍在搜索 Trip.com，找到候选后会自动刷新。";
-  const state = computedResultState(summary);
-  const parts = [];
-  if (state.state === "found-incomplete") parts.push("已找到但未完成");
-  parts.push(message);
-  const candidateCount = Number(summary.candidateCount || 0);
-  if (candidateCount) parts.push(`已找到 ${candidateCount} 家候选`);
+  const parts = [message];
   const elapsed = formatElapsed(data.elapsedMs || progress.elapsedMs);
   if (elapsed) parts.push(`已用时 ${elapsed}`);
   return parts.join("｜");
@@ -843,13 +868,9 @@ function renderResult(data) {
   const mergeLabel = summary.mergedFromCache
     ? `｜已合并旧缓存${summary.cacheCarriedHotelCount ? `，补回 ${summary.cacheCarriedHotelCount} 家` : ""}`
     : "";
-  const partialLabel = summary.partial
-    ? (summary.foundButIncomplete ? "｜已找到但未完成" : (progress.stage === "name-verification" ? "｜中文名核验中" : "｜已先返回候选，后台计算优惠中"))
-    : "";
   const nameLabel = summary.nameVerificationActive ? "｜中文名正在同步更新" : "";
-  const progressLabel = progress.message ? `｜${progress.message}` : "";
   if (sourcePill) {
-    sourcePill.textContent = `${summary.source || "Trip.com 实时价格"}${expanded}${compareLabel}${cacheLabel}${mergeLabel}${partialLabel}${nameLabel}${progressLabel}`;
+    sourcePill.textContent = `${summary.source || "Trip.com 实时价格"}${expanded}${compareLabel}${cacheLabel}${mergeLabel}${nameLabel}`;
   }
 
   const deals = chineseNamedHotels(sortedHotels(data.dealHotels, "deal", summary));
@@ -902,7 +923,7 @@ function handleSearchJobUpdate(data, requestId) {
     setError(data.error || "后台搜索失败");
     return true;
   }
-  setLoading(true, runningMessage(data));
+  setLoading(true, data.result ? "" : runningMessage(data), !data.result);
   return false;
 }
 
@@ -994,7 +1015,7 @@ async function runSearch() {
     fetchHotTargets();
     const pollingJobId = data.summary?.jobId || data.summary?.refreshJobId;
     if ((data.summary?.partial || data.summary?.refreshing) && pollingJobId) {
-      setLoading(true, data.summary.progress?.message || "搜索任务已启动，后台会逐步刷新结果。");
+      setLoading(true, "", false);
       startSearchUpdates(pollingJobId, requestId);
     }
   } catch (error) {
